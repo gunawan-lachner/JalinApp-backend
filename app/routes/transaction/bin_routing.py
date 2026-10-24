@@ -831,9 +831,28 @@ def update_route_unified(route_id):
         new_gateway_id = data.get('gateway_id')
         new_participant_iss_id = data.get('participant_iss_id')
         new_participant_acq_id = data.get('participant_acq_id')
+        # Allow explicit null-clear? No — empty string clears description/rule to "".
+        has_rule = 'rule' in data
+        has_description = 'description' in data
+        new_rule = data.get('rule') if has_rule else None
+        new_description = data.get('description') if has_description else None
 
-        if all(v is None for v in [new_priority, new_gateway_id, new_participant_iss_id, new_participant_acq_id]):
-            return jsonify({"success": False, "error": "At least one field (priority, gateway_id, participant_iss_id, participant_acq_id) must be provided"}), 400
+        if all(
+            v is None
+            for v in [
+                new_priority,
+                new_gateway_id,
+                new_participant_iss_id,
+                new_participant_acq_id,
+            ]
+        ) and not has_rule and not has_description:
+            return jsonify({
+                "success": False,
+                "error": (
+                    "At least one field (priority, gateway_id, participant_iss_id, "
+                    "participant_acq_id, rule, description) must be provided"
+                ),
+            }), 400
 
         # validations
         def to_int_or_none(v):
@@ -852,6 +871,10 @@ def update_route_unified(route_id):
                 new_participant_iss_id = to_int_or_none(new_participant_iss_id)
             if new_participant_acq_id is not None:
                 new_participant_acq_id = to_int_or_none(new_participant_acq_id)
+            if has_rule:
+                new_rule = "" if new_rule is None else str(new_rule)
+            if has_description:
+                new_description = "" if new_description is None else str(new_description)
         except Exception as ve:
             return jsonify({"success": False, "error": f"Validation error: {ve}"}), 400
 
@@ -876,6 +899,12 @@ def update_route_unified(route_id):
         if new_participant_acq_id is not None:
             update_fields.append("participant_acq_id = %s")
             params.append(new_participant_acq_id)
+        if has_rule:
+            update_fields.append("rule = %s")
+            params.append(new_rule)
+        if has_description:
+            update_fields.append("description = %s")
+            params.append(new_description)
         params.append(route_id)
 
         query = f"UPDATE bin_participant SET {', '.join(update_fields)} WHERE id = %s"
@@ -888,7 +917,9 @@ def update_route_unified(route_id):
                     "priority": new_priority,
                     "gateway_id": new_gateway_id,
                     "participant_iss_id": new_participant_iss_id,
-                    "participant_acq_id": new_participant_acq_id
+                    "participant_acq_id": new_participant_acq_id,
+                    "rule": new_rule if has_rule else None,
+                    "description": new_description if has_description else None,
                 }
             })
         else:

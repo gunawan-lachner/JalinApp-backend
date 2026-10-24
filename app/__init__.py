@@ -36,27 +36,15 @@ def create_app():
         instance_relative_config=True,
     )
     
-    # Configure CORS
+    # Configure CORS — allow localhost + LAN origins for multi-device access
     CORS(
         app,
         resources={r"/api/*": {
-            "origins": [
-                "http://localhost:3000", 
-                "http://localhost:3001", 
-                "http://localhost:8004",
-                "http://localhost:8005",
-                "https://willing-sailfish-uniquely.ngrok-free.app", 
-                "https://*.jarvisdev.online", 
-                "https://rna-api.jarvisdev.online",
-                "https://rna.jarvisdev.online", 
-                "http://10.132.130.247:8004", 
-                "http://10.132.130.247:8005"
-            ],
+            "origins": "*",
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             "allow_headers": ["Content-Type", "Accept", "Authorization", "ngrok-skip-browser-warning"],
-            "supports_credentials": True
+            "supports_credentials": False
         }},
-        allow_credentials=True
     )
     
     # Add after_request handler for CORS
@@ -125,6 +113,12 @@ def init_db(app: Flask):
         FOREIGN KEY (id_role) REFERENCES role (id_role)
         )
     ''')
+
+    # Migrate user columns for existing databases
+    cursor.execute("PRAGMA table_info(user)")
+    user_columns = {row[1] for row in cursor.fetchall()}
+    if 'full_name' not in user_columns:
+        cursor.execute("ALTER TABLE user ADD COLUMN full_name TEXT")
     
     # Create role table
     cursor.execute(''' 
@@ -144,6 +138,14 @@ def init_db(app: Flask):
             page_order INTEGER DEFAULT 0
         )
     ''')
+
+    # Migrate page columns for existing databases
+    cursor.execute("PRAGMA table_info(page)")
+    page_columns = {row[1] for row in cursor.fetchall()}
+    if 'icon' not in page_columns:
+        cursor.execute("ALTER TABLE page ADD COLUMN icon TEXT")
+    if 'parent_id' not in page_columns:
+        cursor.execute("ALTER TABLE page ADD COLUMN parent_id INTEGER")
     
     # Create page_role junction table for many-to-many relationship
     cursor.execute('''
@@ -206,9 +208,127 @@ def init_db(app: Flask):
         manager_pages = cursor.fetchall()
         for page in manager_pages:
             cursor.execute("INSERT INTO page_role (id_page, id_role) VALUES (?, ?)", (page[0], 3))
-        
-        conn.commit()
-        conn.close()
+
+    # Ensure IDE parent menu exists and nest RENJS under it when present
+    cursor.execute(
+        "SELECT id_page FROM page WHERE path = ? OR lower(name) = ?",
+        ('/ide', 'ide'),
+    )
+    ide_row = cursor.fetchone()
+    ide_id = None
+    if not ide_row:
+        cursor.execute(
+            "INSERT INTO page (name, path, page_order, icon, parent_id) VALUES (?, ?, ?, ?, NULL)",
+            ('IDE', '/ide', 0, 'FiCode'),
+        )
+        ide_id = cursor.lastrowid
+        cursor.execute(
+            "SELECT id_page FROM page WHERE path = ? OR lower(name) = ?",
+            ('/renjs', 'renjs'),
+        )
+        renjs_for_roles = cursor.fetchone()
+        if renjs_for_roles:
+            cursor.execute(
+                "SELECT id_role FROM page_role WHERE id_page = ?",
+                (renjs_for_roles[0],),
+            )
+            for (role_id,) in cursor.fetchall():
+                cursor.execute(
+                    "INSERT OR IGNORE INTO page_role (id_page, id_role) VALUES (?, ?)",
+                    (ide_id, role_id),
+                )
+        cursor.execute("SELECT id_role FROM role WHERE role_name = 'admin'")
+        admin_role = cursor.fetchone()
+        if admin_role:
+            cursor.execute(
+                "INSERT OR IGNORE INTO page_role (id_page, id_role) VALUES (?, ?)",
+                (ide_id, admin_role[0]),
+            )
+    else:
+        ide_id = ide_row[0]
+
+    cursor.execute(
+        "SELECT id_page, parent_id FROM page WHERE path = ? OR lower(name) = ?",
+        ('/renjs', 'renjs'),
+    )
+    renjs_row = cursor.fetchone()
+    if renjs_row and renjs_row[1] is None and ide_id:
+        cursor.execute(
+            "UPDATE page SET parent_id = ? WHERE id_page = ?",
+            (ide_id, renjs_row[0]),
+        )
+
+    # Ensure Container Plugin menu exists under IDE
+    cursor.execute(
+        "SELECT id_page, parent_id FROM page WHERE path = ? OR lower(name) = ?",
+        ('/container-plugin', 'container plugin'),
+    )
+    cp_row = cursor.fetchone()
+    if not cp_row and ide_id:
+        cursor.execute(
+            "INSERT INTO page (name, path, page_order, icon, parent_id) VALUES (?, ?, ?, ?, ?)",
+            ('Container Plugin', '/container-plugin', 3, 'FiCpu', ide_id),
+        )
+        cp_id = cursor.lastrowid
+        # Copy roles from IDE / RENJS; always include admin
+        cursor.execute(
+            "SELECT id_role FROM page_role WHERE id_page = ?",
+            (ide_id,),
+        )
+        for (role_id,) in cursor.fetchall():
+            cursor.execute(
+                "INSERT OR IGNORE INTO page_role (id_page, id_role) VALUES (?, ?)",
+                (cp_id, role_id),
+            )
+        cursor.execute("SELECT id_role FROM role WHERE role_name = 'admin'")
+        admin_role = cursor.fetchone()
+        if admin_role:
+            cursor.execute(
+                "INSERT OR IGNORE INTO page_role (id_page, id_role) VALUES (?, ?)",
+                (cp_id, admin_role[0]),
+            )
+    elif cp_row and cp_row[1] is None and ide_id:
+        cursor.execute(
+            "UPDATE page SET parent_id = ? WHERE id_page = ?",
+            (ide_id, cp_row[0]),
+        )
+
+    # Ensure GMM menu exists under IDE
+    cursor.execute(
+        "SELECT id_page, parent_id FROM page WHERE path = ? OR lower(name) = ?",
+        ('/gmm', 'gmm'),
+    )
+    gmm_row = cursor.fetchone()
+    if not gmm_row and ide_id:
+        cursor.execute(
+            "INSERT INTO page (name, path, page_order, icon, parent_id) VALUES (?, ?, ?, ?, ?)",
+            ('GMM', '/gmm', 4, 'FiLayers', ide_id),
+        )
+        gmm_id = cursor.lastrowid
+        cursor.execute(
+            "SELECT id_role FROM page_role WHERE id_page = ?",
+            (ide_id,),
+        )
+        for (role_id,) in cursor.fetchall():
+            cursor.execute(
+                "INSERT OR IGNORE INTO page_role (id_page, id_role) VALUES (?, ?)",
+                (gmm_id, role_id),
+            )
+        cursor.execute("SELECT id_role FROM role WHERE role_name = 'admin'")
+        admin_role = cursor.fetchone()
+        if admin_role:
+            cursor.execute(
+                "INSERT OR IGNORE INTO page_role (id_page, id_role) VALUES (?, ?)",
+                (gmm_id, admin_role[0]),
+            )
+    elif gmm_row and gmm_row[1] is None and ide_id:
+        cursor.execute(
+            "UPDATE page SET parent_id = ? WHERE id_page = ?",
+            (ide_id, gmm_row[0]),
+        )
+
+    conn.commit()
+    conn.close()
     print("Database initialized successfully.")
 
 # Create the app instance

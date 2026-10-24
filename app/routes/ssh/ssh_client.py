@@ -69,7 +69,9 @@ def api_execute_command():
         return jsonify({'error': 'Missing connection_name and/or command parameter'}), 400
     try:
         result = execute_ssh_command(connection_name, command)
-        status = 200 if result.get('success') else 400
+        # A command that actually ran (even with a non-zero exit) is HTTP 200
+        # so the client can show stdout and stderr. Connection failures stay 400.
+        status = 400 if result.get('exit_code') is None and not result.get('success') else 200
         return jsonify(result), status
     except Exception as e:
         current_app.logger.exception("Error executing SSH command")
@@ -90,7 +92,7 @@ def api_execute_command_bulk():
             return jsonify({'error': 'Invalid connection data'}), 400
         current_app.logger.info(f"Executing command '{command}' on {name}")
         result = execute_ssh_command(name, command)
-        status = 200 if result.get('success') else 400
+        status = 400 if result.get('exit_code') is None and not result.get('success') else 200
         return jsonify(result), status
     except Exception as e:
         current_app.logger.exception("Bulk command execution error")

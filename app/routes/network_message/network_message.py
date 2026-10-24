@@ -4,11 +4,14 @@ Network Message API Routes
 API endpoints for managing saved network packets/messages
 """
 import os
+import random
 import sqlite3
 import socket
 import ssl
 import struct
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from flask import Blueprint, request, jsonify
@@ -1296,6 +1299,115 @@ class NetworkPacketSender:
         """Send SSL packet (same as HTTPS)"""
         return self.send_https_packet(packet, packet_id)
     
+    def send_quiet(self, packet: Dict, payload: bytes) -> Tuple[bool, str]:
+        """Send one packet without writing per-request traffic logs."""
+        address = str(packet.get('address', '') or packet.get('target_address', '')).strip()
+        port_raw = packet.get('port', '') or packet.get('target_port', '')
+        protocol = str(packet.get('protocol', 'TCP') or 'TCP').upper()
+        try:
+            port = int(port_raw)
+        except (ValueError, TypeError):
+            return False, f"Invalid port: {port_raw}"
+        if not address or port < 1 or port > 65535:
+            return False, "Address and port are required"
+        if not payload:
+            return False, "No data to send"
+
+        if protocol == 'UDP':
+            return self._send_udp_quiet(address, port, payload)
+        if protocol in ('HTTPS', 'SSL'):
+            return self._send_tls_quiet(address, port, payload)
+        return self._send_tcp_quiet(address, port, payload)
+
+    def _send_tcp_quiet(self, address: str, port: int, data: bytes) -> Tuple[bool, str]:
+        """TCP send using the same 4-byte length prefix as a normal send."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        try:
+            sock.connect((address, port))
+            full_data = struct.pack('>I', len(data)) + data
+            total_sent = 0
+            while total_sent < len(full_data):
+                sent = sock.send(full_data[total_sent:])
+                if sent == 0:
+                    return False, "Connection closed"
+                total_sent += sent
+
+            sock.settimeout(5)
+            try:
+                length_prefix = sock.recv(4)
+                if len(length_prefix) == 4:
+                    expected_length = struct.unpack('>I', length_prefix)[0]
+                    if expected_length > 1024 * 1024:
+                        return True, "Response too large"
+                    response = b''
+                    while len(response) < expected_length:
+                        chunk = sock.recv(min(4096, expected_length - len(response)))
+                        if not chunk:
+                            break
+                        response += chunk
+                    return True, response.hex().upper() if response else "Sent successfully (no response)"
+                if length_prefix:
+                    return True, length_prefix.hex().upper()
+                return True, "Sent successfully (no response)"
+            except socket.timeout:
+                return True, "Sent successfully (no response)"
+        except Exception as e:
+            return False, str(e)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _send_udp_quiet(self, address: str, port: int, data: bytes) -> Tuple[bool, str]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(5)
+        try:
+            sock.sendto(data, (address, port))
+            try:
+                response, _addr = sock.recvfrom(4096)
+                return True, response.hex().upper() if response else "Sent successfully (no response)"
+            except socket.timeout:
+                return True, "Sent successfully (no response)"
+        except Exception as e:
+            return False, str(e)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _send_tls_quiet(self, address: str, port: int, data: bytes) -> Tuple[bool, str]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        ssock = None
+        try:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            sock.connect((address, port))
+            ssock = context.wrap_socket(sock, server_hostname=address)
+            ssock.send(data)
+            ssock.settimeout(5)
+            try:
+                response = ssock.recv(4096)
+                return True, response.hex().upper() if response else "Sent successfully (no response)"
+            except socket.timeout:
+                return True, "Sent successfully (no response)"
+        except Exception as e:
+            return False, str(e)
+        finally:
+            try:
+                if ssock:
+                    ssock.close()
+            except Exception:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
     def close_tcp_connection(self, address: str, port: int) -> bool:
         """Close a persistent TCP connection"""
         connection_key = f"{address}:{port}"
@@ -1459,6 +1571,427 @@ def send_packet_by_id(packet_id):
             'success': False,
             'error': str(e)
         }), 500
+
+
+# Stress test limits keep a run inside the same send path as a single packet.
+MAX_STRESS_COUNT = 200
+MAX_STRESS_CONCURRENCY = 10
+MAX_STRESS_DELAY_MS = 2000
+MAX_STRESS_DURATION_SEC = 600
+MAX_LATENCY_SAMPLES = 20000
+
+_ISO_FIXED_LEN = {
+    3: 6, 4: 12, 5: 12, 6: 12, 7: 10, 8: 8, 9: 8, 10: 8,
+    11: 6, 12: 6, 13: 4, 14: 4, 15: 4, 16: 4, 17: 4, 18: 4,
+    19: 3, 20: 3, 21: 3, 22: 3, 23: 3, 24: 3, 25: 2, 26: 2, 27: 1,
+    28: 9, 29: 9, 30: 9, 31: 9,
+    37: 12, 38: 6, 39: 2, 40: 3, 41: 8, 42: 15, 43: 40,
+    49: 3, 50: 3, 51: 3, 52: 8, 53: 16, 64: 8,
+}
+_ISO_LLVAR = {2, 32, 33, 34, 35, 44, 45}
+_ISO_LLLVAR = {36, 46, 47, 48, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63}
+
+_stress_jobs: Dict[str, Dict] = {}
+_stress_jobs_lock = threading.Lock()
+
+
+def _iso_field_end(msg: str, idx: int, field_no: int) -> Optional[int]:
+    if field_no in _ISO_FIXED_LEN:
+        end = idx + _ISO_FIXED_LEN[field_no]
+        return end if end <= len(msg) else None
+    if field_no in _ISO_LLVAR:
+        if idx + 2 > len(msg):
+            return None
+        try:
+            length = int(msg[idx:idx + 2])
+        except ValueError:
+            return None
+        end = idx + 2 + length
+        return end if end <= len(msg) else None
+    if field_no in _ISO_LLLVAR:
+        if idx + 3 > len(msg):
+            return None
+        try:
+            length = int(msg[idx:idx + 3])
+        except ValueError:
+            return None
+        end = idx + 3 + length
+        return end if end <= len(msg) else None
+    return None
+
+
+def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> str:
+    """Advance DE11 and numeric DE37 so each stress request is a distinct transaction."""
+    if not msg or len(msg) < 20 or not msg[:4].isdigit():
+        return msg
+    idx = 4
+    bitmap_hex = msg[idx:idx + 16]
+    idx += 16
+    try:
+        bitmap_bin = ''.join(f'{int(char, 16):04b}' for char in bitmap_hex)
+    except ValueError:
+        return msg
+    if bitmap_bin[:1] == '1':
+        secondary = msg[idx:idx + 16]
+        if len(secondary) < 16:
+            return msg
+        idx += 16
+        try:
+            bitmap_bin += ''.join(f'{int(char, 16):04b}' for char in secondary)
+        except ValueError:
+            return msg
+
+    ranges = {}
+    values = {}
+    for bit_index in range(1, len(bitmap_bin)):
+        if bitmap_bin[bit_index] != '1':
+            continue
+        field_no = bit_index + 1
+        if field_no > 64:
+            break
+        end = _iso_field_end(msg, idx, field_no)
+        if end is None:
+            break
+        values[field_no] = msg[idx:end]
+        ranges[field_no] = (idx, end)
+        idx = end
+        if field_no >= 37 and 11 in ranges:
+            break
+
+    replacements = []
+    if run_offset is None:
+        run_offset = int(time.time() * 1000) % 100000
+    if 11 in values and values[11].isdigit():
+        stan = (int(values[11]) + run_offset + seq) % 1000000
+        replacements.append((ranges[11], f'{stan:06d}'))
+    if 37 in values and values[37].isdigit():
+        rrn = (int(values[37]) + run_offset + seq) % (10 ** 12)
+        replacements.append((ranges[37], f'{rrn:012d}'))
+    if not replacements:
+        return msg
+
+    updated = msg
+    for (start, end), new_value in sorted(replacements, key=lambda item: item[0][0], reverse=True):
+        updated = updated[:start] + new_value + updated[end:]
+    return updated
+
+
+def _payload_for_sequence(packet: Dict, seq: int, increment_stan: bool, run_offset: Optional[int] = None) -> bytes:
+    hex_data = packet.get('hex') or packet.get('hex_data') or ''
+    data = packet_sender.hex_to_bytes(hex_data) if hex_data else b''
+    if not data:
+        ascii_data = packet.get('ascii') or packet.get('ascii_data') or ''
+        data = ascii_data.encode('latin-1', errors='ignore')
+    if increment_stan and data:
+        try:
+            text = data.decode('latin-1')
+            data = _apply_unique_iso(text, seq, run_offset).encode('latin-1')
+        except Exception:
+            pass
+    return data
+
+
+def _percentile(values: List[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = (len(ordered) - 1) * (percentile / 100.0)
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    weight = rank - low
+    return ordered[low] * (1 - weight) + ordered[high] * weight
+
+
+def _sleep_interruptible(stop_event: threading.Event, seconds: float):
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        if stop_event.is_set():
+            return
+        time.sleep(min(0.05, max(0, deadline - time.perf_counter())))
+
+
+def _stress_snapshot(job: Dict) -> Dict:
+    with job['lock']:
+        latencies = list(job['latencies'])
+        completed = job['completed']
+        success_count = job['success_count']
+        fail_count = job['fail_count']
+        status = job['status']
+        started = job['started']
+        finished = job['finished']
+        errors = sorted(job['errors'].items(), key=lambda item: item[1], reverse=True)[:5]
+        total = job['total']
+        target = job['target']
+        protocol = job['protocol']
+        job_id = job['id']
+        mode = job.get('mode', 'count')
+        duration_sec = job.get('duration_sec', 0)
+
+    elapsed_ms = max(0.0, ((finished or time.perf_counter()) - started) * 1000)
+    average = (sum(latencies) / len(latencies)) if latencies else 0.0
+    return {
+        'job_id': job_id,
+        'status': status,
+        'mode': mode,
+        'duration_sec': duration_sec,
+        'total': total,
+        'completed': completed,
+        'success_count': success_count,
+        'fail_count': fail_count,
+        'elapsed_ms': round(elapsed_ms, 1),
+        'rps': round(completed / (elapsed_ms / 1000), 2) if elapsed_ms > 0 else 0,
+        'tps': round(success_count / (elapsed_ms / 1000), 2) if elapsed_ms > 0 else 0,
+        'latency_ms': {
+            'min': round(min(latencies), 1) if latencies else 0,
+            'avg': round(average, 1),
+            'max': round(max(latencies), 1) if latencies else 0,
+            'p95': round(_percentile(latencies, 95), 1),
+        },
+        'errors': [{'message': message, 'count': count} for message, count in errors],
+        'target': target,
+        'protocol': protocol,
+    }
+
+
+def _record_stress_error(job: Dict, message: str):
+    key = (message or 'Error')[:180]
+    job['errors'][key] = job['errors'].get(key, 0) + 1
+
+
+def _stress_time_up(job: Dict) -> bool:
+    if job.get('mode') != 'duration':
+        return False
+    return (time.perf_counter() - job['started']) >= job.get('duration_sec', 0)
+
+
+def _remember_latency(job: Dict, elapsed: float):
+    samples = job['latencies']
+    if len(samples) < MAX_LATENCY_SAMPLES:
+        samples.append(elapsed)
+        return
+    slot = random.randrange(job['completed'])
+    if slot < MAX_LATENCY_SAMPLES:
+        samples[slot] = elapsed
+
+
+def _run_stress_job(job: Dict, packet: Dict, increment_stan: bool):
+    def worker():
+        while not job['stop'].is_set():
+            with job['lock']:
+                if job.get('mode') == 'count' and job['next_index'] >= job['total']:
+                    return
+                if _stress_time_up(job):
+                    return
+                seq = job['next_index']
+                job['next_index'] += 1
+            started = time.perf_counter()
+            ok = False
+            message = 'Error'
+            try:
+                payload = _payload_for_sequence(packet, seq, increment_stan, job.get('stan_offset'))
+                ok, message = packet_sender.send_quiet(packet, payload)
+            except Exception as exc:
+                ok = False
+                message = str(exc)
+            elapsed = (time.perf_counter() - started) * 1000
+            with job['lock']:
+                job['completed'] += 1
+                _remember_latency(job, elapsed)
+                if ok:
+                    job['success_count'] += 1
+                else:
+                    job['fail_count'] += 1
+                    _record_stress_error(job, message)
+            if _stress_time_up(job):
+                return
+            if job['delay_ms']:
+                _sleep_interruptible(job['stop'], job['delay_ms'] / 1000.0)
+
+    try:
+        if job.get('mode') == 'duration':
+            workers = max(1, job['concurrency'])
+        else:
+            workers = max(1, min(job['concurrency'], job['total']))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(worker) for _ in range(workers)]
+            for future in futures:
+                future.result()
+        with job['lock']:
+            if job.get('mode') == 'duration':
+                job['status'] = 'stopped' if job['stop'].is_set() and not _stress_time_up(job) else 'completed'
+            else:
+                stopped_early = job['stop'].is_set() and job['completed'] < job['total']
+                job['status'] = 'stopped' if stopped_early else 'completed'
+            job['finished'] = time.perf_counter()
+    except Exception as exc:
+        with job['lock']:
+            job['status'] = 'failed'
+            job['finished'] = time.perf_counter()
+            _record_stress_error(job, str(exc))
+
+    snapshot = _stress_snapshot(job)
+    packet_id = job.get('packet_id')
+    if snapshot.get('mode') == 'duration':
+        summary = (
+            f"Stress test {snapshot['status']}: {snapshot['success_count']} sukses, "
+            f"gagal {snapshot['fail_count']}, {snapshot['completed']} request dalam "
+            f"{round(snapshot['elapsed_ms'] / 1000, 1)}/{snapshot['duration_sec']} dtk, "
+            f"avg {snapshot['latency_ms']['avg']} ms, {snapshot['tps']} TPS, target {snapshot['target']}"
+        )
+    else:
+        summary = (
+            f"Stress test {snapshot['status']}: {snapshot['success_count']}/{snapshot['total']} sukses, "
+            f"gagal {snapshot['fail_count']}, avg {snapshot['latency_ms']['avg']} ms, "
+            f"{snapshot['tps']} TPS, target {snapshot['target']}"
+        )
+    packet_sender._add_connection_log(
+        connection_id=f"STRESS-{job['id'][:8]}",
+        status='INFO',
+        protocol=snapshot['protocol'],
+        local_address='',
+        remote_address=snapshot['target'],
+        message=summary,
+        packet_id=packet_id,
+    )
+
+
+def _normalize_stress_packet(data: Dict) -> Tuple[Dict, Optional[int]]:
+    packet = data.get('packet') or {}
+    packet_id = data.get('packet_id') or packet.get('id')
+    if packet_id and not (packet.get('hex') or packet.get('ascii') or packet.get('address')):
+        stored = saved_packets_db.get_packet_by_id(int(packet_id))
+        if not stored:
+            raise ValueError('Packet not found')
+        packet = stored
+    address = str(packet.get('address') or packet.get('target_address') or '').strip()
+    port_raw = packet.get('port') if packet.get('port') not in (None, '') else packet.get('target_port')
+    protocol = str(packet.get('protocol') or 'TCP').upper()
+    try:
+        port = int(port_raw)
+    except (ValueError, TypeError):
+        raise ValueError('Port tidak valid')
+    if not address or port < 1 or port > 65535:
+        raise ValueError('Address dan port wajib diisi')
+    if protocol not in ('TCP', 'UDP', 'HTTP', 'HTTPS', 'SSL'):
+        raise ValueError(f'Protocol tidak didukung: {protocol}')
+    hex_data = packet.get('hex') or packet.get('hex_data') or ''
+    ascii_data = packet.get('ascii') or packet.get('ascii_data') or ''
+    if not str(hex_data).strip() and not str(ascii_data).strip():
+        raise ValueError('Payload ASCII atau HEX wajib diisi')
+    normalized = {
+        'address': address,
+        'port': port,
+        'protocol': protocol,
+        'hex': hex_data,
+        'ascii': ascii_data,
+    }
+    try:
+        parsed_id = int(packet_id) if packet_id else None
+    except (ValueError, TypeError):
+        parsed_id = None
+    return normalized, parsed_id
+
+
+def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (ValueError, TypeError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+@network_message_bp.route('/stress-test', methods=['POST'], strict_slashes=False)
+def start_stress_test():
+    """Run a bounded burst of the current packet against its configured target."""
+    try:
+        if not request.is_json:
+            return jsonify({'success': False, 'error': 'Request body must be JSON'}), 400
+        data = request.get_json() or {}
+        packet, packet_id = _normalize_stress_packet(data)
+        mode = str(data.get('mode') or 'count').lower()
+        if mode not in ('count', 'duration'):
+            mode = 'count'
+        if mode == 'duration':
+            duration_sec = _bounded_int(data.get('duration_sec', 60), 60, 1, MAX_STRESS_DURATION_SEC)
+            count = 0
+            concurrency = _bounded_int(data.get('concurrency', 5), 5, 1, MAX_STRESS_CONCURRENCY)
+        else:
+            duration_sec = 0
+            count = _bounded_int(data.get('count', 20), 20, 1, MAX_STRESS_COUNT)
+            concurrency = _bounded_int(
+                data.get('concurrency', 5), 5, 1, min(MAX_STRESS_CONCURRENCY, count)
+            )
+        delay_ms = _bounded_int(data.get('delay_ms', 0), 0, 0, MAX_STRESS_DELAY_MS)
+        increment_stan = bool(data.get('increment_stan', True))
+
+        with _stress_jobs_lock:
+            if any(job['status'] == 'running' for job in _stress_jobs.values()):
+                return jsonify({
+                    'success': False,
+                    'error': 'Stress test lain masih berjalan. Hentikan dulu sebelum memulai yang baru.',
+                }), 409
+            job_id = uuid.uuid4().hex
+            job = {
+                'id': job_id,
+                'status': 'running',
+                'mode': mode,
+                'duration_sec': duration_sec,
+                'total': count,
+                'completed': 0,
+                'success_count': 0,
+                'fail_count': 0,
+                'latencies': [],
+                'errors': {},
+                'started': time.perf_counter(),
+                'finished': None,
+                'stop': threading.Event(),
+                'lock': threading.Lock(),
+                'target': f"{packet['address']}:{packet['port']}",
+                'protocol': packet['protocol'],
+                'packet_id': packet_id,
+                'next_index': 0,
+                'concurrency': concurrency,
+                'delay_ms': delay_ms,
+                'stan_offset': int(uuid.uuid4().int % 100000),
+            }
+            _stress_jobs[job_id] = job
+            finished_ids = [key for key, item in _stress_jobs.items() if item['status'] != 'running']
+            if len(_stress_jobs) > 30:
+                for key in finished_ids[:-10]:
+                    _stress_jobs.pop(key, None)
+
+        thread = threading.Thread(
+            target=_run_stress_job,
+            args=(job, packet, increment_stan),
+            daemon=True,
+        )
+        thread.start()
+        return jsonify({'success': True, 'data': _stress_snapshot(job)})
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
+@network_message_bp.route('/stress-test/<job_id>', methods=['GET'], strict_slashes=False)
+def get_stress_test(job_id):
+    with _stress_jobs_lock:
+        job = _stress_jobs.get(job_id)
+    if not job:
+        return jsonify({'success': False, 'error': 'Stress test tidak ditemukan'}), 404
+    return jsonify({'success': True, 'data': _stress_snapshot(job)})
+
+
+@network_message_bp.route('/stress-test/<job_id>/stop', methods=['POST'], strict_slashes=False)
+def stop_stress_test(job_id):
+    with _stress_jobs_lock:
+        job = _stress_jobs.get(job_id)
+    if not job:
+        return jsonify({'success': False, 'error': 'Stress test tidak ditemukan'}), 404
+    job['stop'].set()
+    return jsonify({'success': True, 'data': _stress_snapshot(job)})
 
 
 # Define specific routes BEFORE parameterized routes to avoid conflicts

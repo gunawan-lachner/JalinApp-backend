@@ -520,6 +520,21 @@ def save_transactions():
             iss_id = trx.get('participant_iss_id')
             acquier_name = participant_mapping.get(acq_id, str(acq_id) if acq_id else '')
             issuer_name = participant_mapping.get(iss_id, str(iss_id) if iss_id else '')
+
+            # Resolve Gateway Name from bin_gateway
+            gateway_id_val = field_mapping.get('IN.GATEWAY_ID', '')
+            gateway_name_val = ''
+            if gateway_id_val:
+                try:
+                    mysql_cursor.execute(
+                        "SELECT name FROM bin_gateway WHERE id = %s LIMIT 1",
+                        (gateway_id_val,),
+                    )
+                    gw_row = mysql_cursor.fetchone()
+                    if gw_row:
+                        gateway_name_val = gw_row.get('name', '') if isinstance(gw_row, dict) else (gw_row[0] or '')
+                except Exception as gw_err:
+                    print(f"Error looking up gateway name for id {gateway_id_val}: {gw_err}")
             
             # Create a saved_transactions record for each transaction with the same saved_id
             sqlite_cursor.execute("""
@@ -546,8 +561,8 @@ def save_transactions():
                 field_mapping.get('IN.MASK_PAN', ''),  # Card Number
                 trx.get('dt'),  # Date n Time
                 trx.get('dttimeout'),  # Date n Time Time Out
-                field_mapping.get('IN.GATEWAY_ID', ''),  # Gateway ID
-                '',  # Gateway Name (not in attributes)
+                gateway_id_val,  # Gateway ID
+                gateway_name_val,  # Gateway Name from bin_gateway
                 iss_id,
                 issuer_name,  # Use mapped name
                 trx.get('msgclass'),  # Msg Class

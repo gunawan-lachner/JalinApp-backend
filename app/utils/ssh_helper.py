@@ -271,16 +271,25 @@ def execute_ssh_command(connection_name, command):
     
     client = client_result['client']
     
-    # Execute command
+    # Execute command. Success follows the remote exit code.
+    # Stderr alone is not a failure: scripts often print warnings there
+    # (for example mv) while still writing the real log to stdout.
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=SSH_TIMEOUT)
-        output = stdout.read().decode('utf-8')
-        error = stderr.read().decode('utf-8')
-        
-        if error:
-            return {'success': False, 'error': error}
-        else:
-            return {'success': True, 'output': output}
+        output = stdout.read().decode('utf-8', errors='replace')
+        error_text = stderr.read().decode('utf-8', errors='replace')
+        exit_code = stdout.channel.recv_exit_status()
+
+        result = {
+            'success': exit_code == 0,
+            'output': output,
+            'exit_code': exit_code,
+        }
+        if error_text.strip():
+            result['error'] = error_text
+        elif exit_code != 0:
+            result['error'] = f'Command exited with status {exit_code}'
+        return result
     except Exception as e:
         return {'success': False, 'error': str(e)}
 
@@ -300,16 +309,21 @@ def execute_ssh_snippet(connection_name, snippet_id):
             continue
         
         result = execute_ssh_command(connection_name, command)
+        text = result.get('output') or ''
+        err = result.get('error') or ''
+        if err:
+            text = text + ('\n' if text else '') + err
+        outputs.append(text)
         if not result['success']:
             return {
-                'success': False, 
-                'error': result['error'],
+                'success': False,
+                'error': err or f"Command exited with status {result.get('exit_code')}",
+                'exit_code': result.get('exit_code'),
+                'output': result.get('output') or '',
                 'snippet_name': snippet['name'],
                 'commands': commands[:commands.index(command) + 1],
                 'outputs': outputs
             }
-        
-        outputs.append(result['output'])
     
     return {
         'success': True,

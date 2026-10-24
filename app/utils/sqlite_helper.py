@@ -354,10 +354,10 @@ def enrich_transactions_with_sqlite_data(transactions):
     for trx in transactions:
         enriched_trx = dict(trx)  # Create a copy
         
-        # Add Gateway Name
+        # Add Gateway Name (only if not already present from MySQL)
         gateway_id = trx.get('Gateway ID')
-        if gateway_id is not None and 'bin_gateway' in reference_data:
-            enriched_trx['Gateway Name'] = reference_data['bin_gateway'].get(gateway_id, '')
+        if gateway_id is not None and 'bin_gateway' in reference_data and not trx.get('Gateway Name'):
+            enriched_trx['Gateway Name'] = reference_data['bin_gateway'].get(str(gateway_id), '')
             
         # Add Acquirer Name (only if not already present from MySQL)
         acq_id = trx.get('Acq ID')

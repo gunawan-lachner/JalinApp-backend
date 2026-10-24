@@ -21,6 +21,9 @@ from app.routes.participant.participant import participant_bp
 # RENJS API Routes
 from app.routes.renjs.renjs import renjs_bp
 
+# GMM API Routes
+from app.routes.gmm.gmm import gmm_bp
+
 # Gateway API Routes
 from app.routes.gateway.gateway import gateway_bp
 from app.routes.gateway.routing import routing_api_bp
@@ -79,6 +82,9 @@ def register_blueprints(app):
 
     # RENJS API routes
     app.register_blueprint(renjs_bp, url_prefix='/api/renjs')
+
+    # GMM API routes
+    app.register_blueprint(gmm_bp, url_prefix='/api/gmm')
     
     # Gateway API routes
     app.register_blueprint(gateway_bp, url_prefix='/api/gateway')

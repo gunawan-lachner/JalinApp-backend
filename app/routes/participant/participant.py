@@ -42,8 +42,11 @@ def get_participants():
     column_filters = data.get('column_filters') or {}
     if not isinstance(column_filters, dict):
         column_filters = {}
+    filters = data.get('filters') or data.get('dynamic_filters') or []
+    if not isinstance(filters, list):
+        filters = []
 
-    # Build WHERE: optional global search (OR across fields) AND optional per-column filters (AND)
+    # Build WHERE: optional global search (OR across fields) AND optional per-column / dynamic filters (AND)
     where_parts = []
     params = []
     if search:
@@ -54,6 +57,16 @@ def get_participants():
         if key in fields and val is not None and str(val).strip():
             where_parts.append(f"CAST(`{key}` AS CHAR) LIKE %s")
             params.append(f"%{str(val).strip()}%")
+    for f in filters:
+        if not isinstance(f, dict):
+            continue
+        field = (f.get('field') or '').strip()
+        if field not in fields:
+            continue
+        expr, expr_params = _build_cp_filter_clause('p', field, f.get('operator'), f.get('value'))
+        if expr:
+            where_parts.append(expr)
+            params.extend(expr_params)
     where_clause = ('WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
     try:
         import time
@@ -116,6 +129,125 @@ def get_participants():
         print(f"Error details: {error_details}")
         return jsonify({'error': str(e), 'details': error_details, 'execution_time': None, 'executed_sql': None}), 500
 
+# Allowed operators for dynamic container_plugin / attr filters
+_CP_ALLOWED_OPS = {
+    '=', '!=', '>', '<', '>=', '<=', 'LIKE', 'NOT LIKE',
+    'STARTS_WITH', 'ENDS_WITH', 'IS_EMPTY', 'IS_NOT_EMPTY',
+}
+
+_CP_PLUGIN_COLUMNS = {
+    'id', 'name', 'plugin_id', 'node_type', 'container_id',
+    'in_next_plugin', 'out_next_plugin', 'connectto_ipport',
+    'port_listen', 'queue_threshold', 'response_timeout',
+    'startup_order', 'state_startup', 'dynamic_creation_mode',
+    'max_dynamic_instances', 'flapping_ignore_time', 'cnt_instances',
+    'comments',
+}
+
+_CP_ATTR_COLUMNS = {'id', 'container_plugin_id', 'field', 'content'}
+
+_CP_FILTER_FIELDS = [
+    {'label': 'Plugin: ID', 'value': 'cp.id', 'table': 'cp'},
+    {'label': 'Plugin: Name', 'value': 'cp.name', 'table': 'cp'},
+    {'label': 'Plugin: Container ID', 'value': 'cp.container_id', 'table': 'cp'},
+    {'label': 'Plugin: Plugin ID', 'value': 'cp.plugin_id', 'table': 'cp'},
+    {'label': 'Plugin: State Startup', 'value': 'cp.state_startup', 'table': 'cp'},
+    {'label': 'Plugin: Port Listen', 'value': 'cp.port_listen', 'table': 'cp'},
+    {'label': 'Plugin: Instances', 'value': 'cp.cnt_instances', 'table': 'cp'},
+    {'label': 'Plugin: In Next', 'value': 'cp.in_next_plugin', 'table': 'cp'},
+    {'label': 'Plugin: Out Next', 'value': 'cp.out_next_plugin', 'table': 'cp'},
+    {'label': 'Plugin: Connect To', 'value': 'cp.connectto_ipport', 'table': 'cp'},
+    {'label': 'Plugin: Queue Threshold', 'value': 'cp.queue_threshold', 'table': 'cp'},
+    {'label': 'Plugin: Node Type', 'value': 'cp.node_type', 'table': 'cp'},
+    {'label': 'Plugin: Startup Order', 'value': 'cp.startup_order', 'table': 'cp'},
+    {'label': 'Plugin: Response Timeout', 'value': 'cp.response_timeout', 'table': 'cp'},
+    {'label': 'Plugin: Comments', 'value': 'cp.comments', 'table': 'cp'},
+    {'label': 'Attr: ID', 'value': 'attr.id', 'table': 'attr'},
+    {'label': 'Attr: Plugin ID', 'value': 'attr.container_plugin_id', 'table': 'attr'},
+    {'label': 'Attr: Field', 'value': 'attr.field', 'table': 'attr'},
+    {'label': 'Attr: Content', 'value': 'attr.content', 'table': 'attr'},
+]
+
+_CP_FILTER_OPERATORS = [
+    {'label': '=', 'value': '='},
+    {'label': '!=', 'value': '!='},
+    {'label': '>', 'value': '>'},
+    {'label': '<', 'value': '<'},
+    {'label': '>=', 'value': '>='},
+    {'label': '<=', 'value': '<='},
+    {'label': 'LIKE', 'value': 'LIKE'},
+    {'label': 'NOT LIKE', 'value': 'NOT LIKE'},
+    {'label': 'starts with', 'value': 'STARTS_WITH'},
+    {'label': 'ends with', 'value': 'ENDS_WITH'},
+    {'label': 'is empty', 'value': 'IS_EMPTY'},
+    {'label': 'is not empty', 'value': 'IS_NOT_EMPTY'},
+]
+
+
+def _parse_cp_filter_field(field_key):
+    """Return (table, column) or None if invalid."""
+    if not field_key or not isinstance(field_key, str):
+        return None
+    if '.' in field_key:
+        table, column = field_key.split('.', 1)
+    else:
+        table, column = 'cp', field_key
+    table = table.strip().lower()
+    column = column.strip().lower()
+    if table == 'cp' and column in _CP_PLUGIN_COLUMNS:
+        return 'cp', column
+    if table in ('attr', 'cpa') and column in _CP_ATTR_COLUMNS:
+        return 'attr', column
+    return None
+
+
+def _build_cp_filter_clause(table, column, operator, value):
+    """
+    Build a SQL predicate fragment and params for one filter.
+    For attr table, column is used inside EXISTS subquery separately.
+    Returns (sql_expr_without_alias, params) where sql_expr uses `{col}` placeholder.
+    """
+    op = (operator or '=').strip().upper()
+    if op not in {o.upper() for o in _CP_ALLOWED_OPS}:
+        return None, []
+
+    col_ref = f'`{column}`'
+    if op == 'IS_EMPTY':
+        return f"({col_ref} IS NULL OR CAST({col_ref} AS CHAR) = '')", []
+    if op == 'IS_NOT_EMPTY':
+        return f"({col_ref} IS NOT NULL AND CAST({col_ref} AS CHAR) <> '')", []
+
+    raw = '' if value is None else str(value)
+    if raw.strip() == '':
+        # Inactive filter (no value)
+        return None, []
+
+    if op == 'STARTS_WITH':
+        return f"CAST({col_ref} AS CHAR) LIKE %s", [f'{raw}%']
+    if op == 'ENDS_WITH':
+        return f"CAST({col_ref} AS CHAR) LIKE %s", [f'%{raw}']
+    if op == 'LIKE':
+        return f"CAST({col_ref} AS CHAR) LIKE %s", [f'%{raw}%']
+    if op == 'NOT LIKE':
+        return f"CAST({col_ref} AS CHAR) NOT LIKE %s", [f'%{raw}%']
+    if op in ('=', '!=', '>', '<', '>=', '<='):
+        sql_op = '<>' if op == '!=' else op
+        return f"{col_ref} {sql_op} %s", [raw]
+    return None, []
+
+
+def _connect_profile_db(profile):
+    return pymysql.connect(
+        host=profile['host'],
+        port=int(profile['port']) if profile.get('port') else 3306,
+        user=profile['user'],
+        password=profile['password'],
+        database=profile['database'],
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+
+
 @participant_bp.route('/containerPlugin', methods=['POST'])
 def get_container_plugin():
     """
@@ -124,7 +256,6 @@ def get_container_plugin():
     Request JSON body:
       - name: container plugin name (required)
     """
-    import pymysql
     if not request.is_json:
         return jsonify({'error': 'Request body must be JSON'}), 400
     data = request.get_json()
@@ -139,15 +270,7 @@ def get_container_plugin():
     if not profile:
         return jsonify({'error': f'Profile {profile_id} not found'}), 404
     try:
-        conn = pymysql.connect(
-            host=profile['host'],
-            port=int(profile['port']) if profile.get('port') else 3306,
-            user=profile['user'],
-            password=profile['password'],
-            database=profile['database'],
-            charset='utf8mb4',
-            cursorclass=pymysql.cursors.DictCursor
-        )
+        conn = _connect_profile_db(profile)
         with conn.cursor() as cursor:
             sql = """
                 SELECT * FROM container_plugin WHERE name = %s
@@ -162,6 +285,674 @@ def get_container_plugin():
         print(f"Error in get_container_plugin: {e}")
         print(f"Error details: {error_details}")
         return jsonify({'error': str(e), 'details': error_details}), 500
+
+
+@participant_bp.route('/containerPlugin/meta', methods=['GET', 'POST', 'OPTIONS'], strict_slashes=False)
+def container_plugin_filter_meta():
+    """Return available filter fields and operators for Container Plugin search."""
+    if request.method == 'OPTIONS':
+        return '', 204
+    return jsonify({
+        'filterFields': _CP_FILTER_FIELDS,
+        'filterOperators': _CP_FILTER_OPERATORS,
+    })
+
+
+@participant_bp.route('/containerPlugin/names', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def list_container_plugin_names():
+    """
+    List container_plugin.name values for dropdowns (in_next / out_next).
+    Body: { profileId }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    if not request.is_json:
+        return jsonify({'success': False, 'error': 'Request body must be JSON'}), 400
+    data = request.get_json() or {}
+    profile_id = data.get('profileId')
+    if not profile_id:
+        return jsonify({'success': False, 'error': 'Missing profileId parameter'}), 400
+
+    profiles = load_profiles()
+    profile = next((p for p in profiles if p.get('name') == profile_id), None)
+    if not profile:
+        return jsonify({'success': False, 'error': f'Profile {profile_id} not found'}), 404
+
+    try:
+        conn = _connect_profile_db(profile)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                '''
+                SELECT DISTINCT name
+                FROM container_plugin
+                WHERE name IS NOT NULL AND TRIM(name) <> ''
+                ORDER BY name ASC
+                '''
+            )
+            rows = cursor.fetchall() or []
+        conn.close()
+        names = [r['name'] for r in rows if r.get('name')]
+        return jsonify({
+            'success': True,
+            'data': names,
+            'error': None,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'data': [],
+            'error': str(e),
+            'details': traceback.format_exc(),
+        }), 500
+
+
+@participant_bp.route('/by-container-plugin', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def get_participant_by_container_plugin():
+    """
+    Find participant(s) by exact container_plugin_name.
+    Body: { profileId, container_plugin_name }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    if not request.is_json:
+        return jsonify({'success': False, 'error': 'Request body must be JSON'}), 400
+    data = request.get_json() or {}
+    profile_id = data.get('profileId')
+    cp_name = (data.get('container_plugin_name') or data.get('name') or '').strip()
+    if not profile_id:
+        return jsonify({'success': False, 'error': 'Missing profileId parameter'}), 400
+    if not cp_name:
+        return jsonify({'success': False, 'error': 'Missing container_plugin_name parameter'}), 400
+
+    profiles = load_profiles()
+    profile = next((p for p in profiles if p.get('name') == profile_id), None)
+    if not profile:
+        return jsonify({'success': False, 'error': f'Profile {profile_id} not found'}), 404
+
+    fields = [
+        'id', 'ext_id', 'participant_type', 'name', 'container_plugin_name',
+        'network_type', 'active', 'display_on_ui', 'comments',
+    ]
+    try:
+        conn = _connect_profile_db(profile)
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"SELECT {', '.join(fields)} FROM participant "
+                f"WHERE container_plugin_name = %s ORDER BY id ASC",
+                (cp_name,),
+            )
+            rows = cursor.fetchall() or []
+        conn.close()
+        if not rows:
+            return jsonify({
+                'success': False,
+                'data': [],
+                'error': (
+                    f'Participant dengan container_plugin_name "{cp_name}" '
+                    f'tidak ditemukan'
+                ),
+            }), 404
+        return jsonify({
+            'success': True,
+            'data': rows,
+            'total_rows': len(rows),
+            'error': None,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'data': [],
+            'error': str(e),
+            'details': traceback.format_exc(),
+        }), 500
+
+
+@participant_bp.route('/plugin/detail', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def plugin_table_detail():
+    """
+    Get one row from the `plugin` table by id.
+    Used when clicking plugin_id on Container Plugin menu.
+    Body: { profileId, id }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    if not request.is_json:
+        return jsonify({'success': False, 'error': 'Request body must be JSON'}), 400
+    data = request.get_json() or {}
+    profile_id = data.get('profileId')
+    plugin_id = data.get('id')
+    if not profile_id:
+        return jsonify({'success': False, 'error': 'Missing profileId parameter'}), 400
+    if plugin_id is None or str(plugin_id).strip() == '':
+        return jsonify({'success': False, 'error': 'Missing id parameter'}), 400
+
+    profiles = load_profiles()
+    profile = next((p for p in profiles if p.get('name') == profile_id), None)
+    if not profile:
+        return jsonify({'success': False, 'error': f'Profile {profile_id} not found'}), 404
+
+    try:
+        conn = _connect_profile_db(profile)
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT * FROM plugin WHERE id = %s', (plugin_id,))
+            row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return jsonify({
+                'success': False,
+                'error': f'Plugin id {plugin_id} tidak ditemukan di tabel plugin',
+            }), 404
+        return jsonify({
+            'success': True,
+            'data': row,
+            'error': None,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'details': traceback.format_exc(),
+        }), 500
+
+
+@participant_bp.route('/plugin/<int:plugin_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+def update_plugin_table_row(plugin_id):
+    """
+    Update a row in the `plugin` table by id.
+    Body: { profileId, ...column values to update }
+    Only columns that already exist on the row (except id) are updated.
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    if not request.is_json:
+        return jsonify({'success': False, 'error': 'Request body must be JSON'}), 400
+    data = request.get_json() or {}
+    profile_id = data.get('profileId')
+    if not profile_id:
+        return jsonify({'success': False, 'error': 'Missing profileId parameter'}), 400
+
+    profiles = load_profiles()
+    profile = next((p for p in profiles if p.get('name') == profile_id), None)
+    if not profile:
+        return jsonify({'success': False, 'error': f'Profile {profile_id} not found'}), 404
+
+    try:
+        conn = _connect_profile_db(profile)
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT * FROM plugin WHERE id = %s', (plugin_id,))
+            current = cursor.fetchone()
+            if not current:
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'error': f'Plugin id {plugin_id} tidak ditemukan di tabel plugin',
+                }), 404
+
+            allowed = {k for k in current.keys() if k != 'id'}
+            updates = {}
+            for key, value in data.items():
+                if key in ('profileId', 'id'):
+                    continue
+                if key not in allowed:
+                    continue
+                updates[key] = value
+
+            if not updates:
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'No fields to update',
+                }), 400
+
+            if 'name' in updates:
+                name_val = ('' if updates['name'] is None else str(updates['name'])).strip()
+                if not name_val:
+                    conn.close()
+                    return jsonify({
+                        'success': False,
+                        'error': 'name tidak boleh kosong',
+                    }), 400
+                updates['name'] = name_val
+                current_name = ('' if current.get('name') is None else str(current.get('name'))).strip()
+                if name_val != current_name:
+                    cursor.execute(
+                        'SELECT id FROM plugin WHERE name = %s AND id <> %s',
+                        (name_val, plugin_id),
+                    )
+                    conflict = cursor.fetchone()
+                    if conflict:
+                        conn.close()
+                        return jsonify({
+                            'success': False,
+                            'error': (
+                                f'Nama plugin "{name_val}" sudah digunakan '
+                                f'oleh ID {conflict.get("id")}'
+                            ),
+                        }), 400
+
+            set_clause = ', '.join([f'`{k}` = %s' for k in updates.keys()])
+            cursor.execute(
+                f'UPDATE plugin SET {set_clause} WHERE id = %s',
+                list(updates.values()) + [plugin_id],
+            )
+            conn.commit()
+            cursor.execute('SELECT * FROM plugin WHERE id = %s', (plugin_id,))
+            updated = cursor.fetchone()
+        conn.close()
+        return jsonify({
+            'success': True,
+            'message': 'Plugin updated successfully',
+            'data': updated,
+        }), 200
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': f'Failed to update plugin: {str(e)}',
+            'details': traceback.format_exc(),
+        }), 500
+
+
+@participant_bp.route('/containerPlugin/search', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def search_container_plugins():
+    """
+    Search container_plugin with optional filters on container_plugin and container_plugin_attr.
+    Body:
+      - profileId (required)
+      - page, page_size
+      - search (optional quick search on name/id/comments)
+      - filters: [{ field, operator, value }]
+        field examples: cp.name, attr.field, attr.content
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    import time
+    if not request.is_json:
+        return jsonify({'error': 'Request body must be JSON'}), 400
+    data = request.get_json() or {}
+    profile_id = data.get('profileId')
+    if not profile_id:
+        return jsonify({'error': 'Missing profileId parameter'}), 400
+
+    page = max(int(data.get('page', 1) or 1), 1)
+    page_size = min(max(int(data.get('page_size', 50) or 50), 1), 500)
+    offset = (page - 1) * page_size
+    search = (data.get('search') or '').strip()
+    filters = data.get('filters') or data.get('dynamic_filters') or []
+    if not isinstance(filters, list):
+        filters = []
+
+    profiles = load_profiles()
+    profile = next((p for p in profiles if p.get('name') == profile_id), None)
+    if not profile:
+        return jsonify({'error': f'Profile {profile_id} not found'}), 404
+
+    where_parts = []
+    params = []
+
+    if search:
+        like = f'%{search}%'
+        where_parts.append(
+            '('
+            'CAST(cp.id AS CHAR) LIKE %s OR '
+            'CAST(cp.name AS CHAR) LIKE %s OR '
+            'CAST(IFNULL(cp.comments, "") AS CHAR) LIKE %s OR '
+            'CAST(IFNULL(cp.in_next_plugin, "") AS CHAR) LIKE %s OR '
+            'CAST(IFNULL(cp.out_next_plugin, "") AS CHAR) LIKE %s'
+            ')'
+        )
+        params.extend([like, like, like, like, like])
+
+    for f in filters:
+        if not isinstance(f, dict):
+            continue
+        parsed = _parse_cp_filter_field(f.get('field'))
+        if not parsed:
+            continue
+        table, column = parsed
+        expr, expr_params = _build_cp_filter_clause(table, column, f.get('operator'), f.get('value'))
+        if not expr:
+            continue
+        if table == 'cp':
+            # Qualify column with cp alias
+            qualified = expr.replace(f'`{column}`', f'`cp`.`{column}`')
+            where_parts.append(qualified)
+            params.extend(expr_params)
+        else:
+            # Attr filter via EXISTS so we return matching plugins
+            attr_expr = expr.replace(f'`{column}`', f'`cpa`.`{column}`')
+            where_parts.append(
+                f'EXISTS (SELECT 1 FROM container_plugin_attr cpa '
+                f'WHERE cpa.container_plugin_id = cp.id AND {attr_expr})'
+            )
+            params.extend(expr_params)
+
+    where_sql = (' WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
+    list_sql = f'''
+        SELECT cp.*
+        FROM container_plugin cp
+        {where_sql}
+        ORDER BY cp.id ASC
+        LIMIT %s OFFSET %s
+    '''
+    count_sql = f'''
+        SELECT COUNT(*) AS total
+        FROM container_plugin cp
+        {where_sql}
+    '''
+
+    t0 = time.time()
+    try:
+        conn = _connect_profile_db(profile)
+        with conn.cursor() as cursor:
+            cursor.execute(count_sql, params)
+            total_rows = int((cursor.fetchone() or {}).get('total') or 0)
+            cursor.execute(list_sql, params + [page_size, offset])
+            rows = cursor.fetchall() or []
+        conn.close()
+        return jsonify({
+            'success': True,
+            'data': rows,
+            'total_rows': total_rows,
+            'page': page,
+            'page_size': page_size,
+            'execution_time': round(time.time() - t0, 6),
+            'filterFields': _CP_FILTER_FIELDS,
+            'filterOperators': _CP_FILTER_OPERATORS,
+            'error': None,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'data': [],
+            'total_rows': 0,
+            'page': page,
+            'page_size': page_size,
+            'error': str(e),
+            'details': traceback.format_exc(),
+            'execution_time': round(time.time() - t0, 6),
+        }), 500
+
+
+@participant_bp.route('/containerPlugin/detail', methods=['POST', 'OPTIONS'], strict_slashes=False)
+def container_plugin_detail():
+    """
+    Get one container_plugin by id (or name) plus its container_plugin_attr rows.
+    Optionally re-apply attr filters so matching attrs are highlighted / filtered in dialog.
+    Body:
+      - profileId (required)
+      - id OR name
+      - filters (optional attr filters to apply on returned attrs)
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    import time
+    if not request.is_json:
+        return jsonify({'error': 'Request body must be JSON'}), 400
+    data = request.get_json() or {}
+    profile_id = data.get('profileId')
+    plugin_id = data.get('id')
+    name = (data.get('name') or '').strip()
+    filters = data.get('filters') or data.get('dynamic_filters') or []
+    if not isinstance(filters, list):
+        filters = []
+
+    if not profile_id:
+        return jsonify({'error': 'Missing profileId parameter'}), 400
+    if plugin_id is None and not name:
+        return jsonify({'error': 'Missing id or name parameter'}), 400
+
+    profiles = load_profiles()
+    profile = next((p for p in profiles if p.get('name') == profile_id), None)
+    if not profile:
+        return jsonify({'error': f'Profile {profile_id} not found'}), 404
+
+    t0 = time.time()
+    try:
+        conn = _connect_profile_db(profile)
+        with conn.cursor() as cursor:
+            if plugin_id is not None and str(plugin_id).strip() != '':
+                cursor.execute('SELECT * FROM container_plugin WHERE id = %s', (plugin_id,))
+            else:
+                cursor.execute('SELECT * FROM container_plugin WHERE name = %s', (name,))
+            plugin = cursor.fetchone()
+            if not plugin:
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'Container plugin tidak ditemukan',
+                }), 404
+
+            attr_where = ['container_plugin_id = %s']
+            attr_params = [plugin['id']]
+            for f in filters:
+                if not isinstance(f, dict):
+                    continue
+                parsed = _parse_cp_filter_field(f.get('field'))
+                if not parsed:
+                    continue
+                table, column = parsed
+                if table != 'attr':
+                    continue
+                expr, expr_params = _build_cp_filter_clause(
+                    table, column, f.get('operator'), f.get('value')
+                )
+                if not expr:
+                    continue
+                attr_where.append(expr)
+                attr_params.extend(expr_params)
+
+            # Always also fetch all attrs for the dialog; filtered subset separately
+            cursor.execute(
+                '''
+                SELECT id, container_plugin_id, field, content
+                FROM container_plugin_attr
+                WHERE container_plugin_id = %s
+                ORDER BY id ASC
+                ''',
+                (plugin['id'],),
+            )
+            all_attrs = cursor.fetchall() or []
+
+            filtered_attrs = all_attrs
+            if len(attr_where) > 1:
+                cursor.execute(
+                    f'''
+                    SELECT id, container_plugin_id, field, content
+                    FROM container_plugin_attr
+                    WHERE {' AND '.join(attr_where)}
+                    ORDER BY id ASC
+                    ''',
+                    attr_params,
+                )
+                filtered_attrs = cursor.fetchall() or []
+
+        conn.close()
+        return jsonify({
+            'success': True,
+            'data': {
+                'plugin': plugin,
+                'attrs': all_attrs,
+                'filtered_attrs': filtered_attrs,
+            },
+            'execution_time': round(time.time() - t0, 6),
+            'error': None,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'details': traceback.format_exc(),
+            'execution_time': round(time.time() - t0, 6),
+        }), 500
+
+
+_CP_UPDATABLE_COLUMNS = [
+    'container_id', 'plugin_id', 'name', 'state_startup', 'port_listen',
+    'cnt_instances', 'in_next_plugin', 'out_next_plugin', 'connectto_ipport',
+    'comments', 'queue_threshold', 'node_type', 'startup_order',
+    'flapping_ignore_time', 'max_dynamic_instances', 'dynamic_creation_mode',
+    'response_timeout',
+]
+
+_CP_ATTR_UPDATABLE_COLUMNS = ['field', 'content']
+
+
+@participant_bp.route('/containerPlugin/<int:plugin_id>', methods=['PUT', 'OPTIONS'], strict_slashes=False)
+def update_container_plugin(plugin_id):
+    """
+    Update container_plugin by id.
+    Body: { profileId, ...updatable fields, attrs?: [{id?, field, content, _delete?}] }
+    If attrs is provided:
+      - existing id -> update field/content
+      - id with _delete true -> delete
+      - no id -> insert new attr for this plugin
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    if not request.is_json:
+        return jsonify({'success': False, 'error': 'Request body must be JSON'}), 400
+    data = request.get_json() or {}
+    profile_id = data.get('profileId')
+    if not profile_id:
+        return jsonify({'success': False, 'error': 'Missing profileId parameter'}), 400
+
+    profiles = load_profiles()
+    profile = next((p for p in profiles if p.get('name') == profile_id), None)
+    if not profile:
+        return jsonify({'success': False, 'error': f'Profile {profile_id} not found'}), 404
+
+    updates = {k: data.get(k) for k in _CP_UPDATABLE_COLUMNS if k in data}
+    attrs_payload = data.get('attrs')
+    if attrs_payload is not None and not isinstance(attrs_payload, list):
+        return jsonify({'success': False, 'error': 'attrs must be an array'}), 400
+
+    if not updates and attrs_payload is None:
+        return jsonify({'success': False, 'error': 'No fields to update'}), 400
+
+    if 'name' in updates:
+        name_val = (updates.get('name') or '').strip() if updates.get('name') is not None else ''
+        if not name_val:
+            return jsonify({'success': False, 'error': 'name tidak boleh kosong'}), 400
+        updates['name'] = name_val
+
+    try:
+        conn = _connect_profile_db(profile)
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT * FROM container_plugin WHERE id = %s', (plugin_id,))
+            current = cursor.fetchone()
+            if not current:
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'error': f'Container plugin id {plugin_id} tidak ditemukan',
+                }), 404
+
+            # Skip name uniqueness when nama tidak benar-benar berubah
+            if 'name' in updates:
+                current_name = (current.get('name') or '').strip()
+                if updates['name'] == current_name:
+                    # Tidak rename — jangan update kolom name
+                    updates.pop('name', None)
+                else:
+                    cursor.execute(
+                        'SELECT id, name FROM container_plugin WHERE name = %s AND id <> %s',
+                        (updates['name'], plugin_id),
+                    )
+                    conflict = cursor.fetchone()
+                    if conflict:
+                        conn.close()
+                        return jsonify({
+                            'success': False,
+                            'error': (
+                                f'Nama container_plugin "{updates["name"]}" sudah digunakan '
+                                f'oleh ID {conflict.get("id")}'
+                            ),
+                        }), 400
+
+            if updates:
+                set_clause = ', '.join([f'`{k}` = %s' for k in updates.keys()])
+                cursor.execute(
+                    f'UPDATE container_plugin SET {set_clause} WHERE id = %s',
+                    list(updates.values()) + [plugin_id],
+                )
+
+            if attrs_payload is not None:
+                for attr in attrs_payload:
+                    if not isinstance(attr, dict):
+                        continue
+                    attr_id = attr.get('id')
+                    do_delete = bool(attr.get('_delete'))
+                    if do_delete and attr_id is not None:
+                        cursor.execute(
+                            'DELETE FROM container_plugin_attr '
+                            'WHERE id = %s AND container_plugin_id = %s',
+                            (attr_id, plugin_id),
+                        )
+                        continue
+
+                    field_val = attr.get('field')
+                    content_val = attr.get('content')
+                    if attr_id is not None and str(attr_id).strip() != '':
+                        attr_updates = {}
+                        if 'field' in attr:
+                            attr_updates['field'] = field_val
+                        if 'content' in attr:
+                            attr_updates['content'] = content_val
+                        if not attr_updates:
+                            continue
+                        set_attr = ', '.join([f'`{k}` = %s' for k in attr_updates.keys()])
+                        cursor.execute(
+                            f'UPDATE container_plugin_attr SET {set_attr} '
+                            f'WHERE id = %s AND container_plugin_id = %s',
+                            list(attr_updates.values()) + [attr_id, plugin_id],
+                        )
+                    else:
+                        # insert new
+                        if field_val is None or str(field_val).strip() == '':
+                            continue
+                        cursor.execute(
+                            'INSERT INTO container_plugin_attr '
+                            '(container_plugin_id, field, content) VALUES (%s, %s, %s)',
+                            (plugin_id, field_val, content_val if content_val is not None else ''),
+                        )
+
+            conn.commit()
+
+            cursor.execute('SELECT * FROM container_plugin WHERE id = %s', (plugin_id,))
+            plugin = cursor.fetchone()
+            cursor.execute(
+                '''
+                SELECT id, container_plugin_id, field, content
+                FROM container_plugin_attr
+                WHERE container_plugin_id = %s
+                ORDER BY id ASC
+                ''',
+                (plugin_id,),
+            )
+            attrs = cursor.fetchall() or []
+        conn.close()
+        return jsonify({
+            'success': True,
+            'message': 'Container plugin updated successfully',
+            'data': {
+                'plugin': plugin,
+                'attrs': attrs,
+            },
+        }), 200
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': f'Failed to update container plugin: {str(e)}',
+            'details': traceback.format_exc(),
+        }), 500
+
 
 @participant_bp.route('/duplicate-info', methods=['POST'])
 def get_duplicate_info():

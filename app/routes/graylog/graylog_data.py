@@ -207,174 +207,340 @@ def enhance_message_with_rules(message, rules):
     
     return enhanced_message
 
+def _dedupe_graylog_messages(messages):
+    """Deduplicate GrayLog messages by message id."""
+    unique_messages = []
+    seen_ids = set()
+    for message in messages:
+        message_data = message.get('message', {})
+        message_id = message_data.get('_id') or message_data.get('gl2_message_id')
+        if message_id and message_id not in seen_ids:
+            unique_messages.append(message)
+            seen_ids.add(message_id)
+        elif not message_id:
+            unique_messages.append(message)
+    return unique_messages
+
+def _search_graylog_views_api(base_url, headers, auth, verify_ssl, query, from_time, to_time, limit):
+    """
+    GrayLog 4.x Views Search API (same path the web UI uses).
+    User 'monitoring' has access here even when legacy /api/search/universal/* returns 403.
+    """
+    create_url = f"{base_url}/api/views/search"
+    payload = {
+        "queries": [
+            {
+                "id": "query-1",
+                "query": {"type": "elasticsearch", "query_string": query},
+                "timerange": {
+                    "type": "absolute",
+                    "from": from_time,
+                    "to": to_time,
+                },
+                "search_types": [
+                    {
+                        "id": "messages-1",
+                        "type": "messages",
+                        "limit": limit,
+                        "offset": 0,
+                        "sort": [{"field": "timestamp", "order": "DESC"}],
+                    }
+                ],
+            }
+        ]
+    }
+
+    create_resp = requests.post(
+        create_url,
+        headers=headers,
+        auth=auth,
+        json=payload,
+        verify=verify_ssl,
+        timeout=30,
+    )
+    if not create_resp.ok:
+        return {
+            "ok": False,
+            "status": create_resp.status_code,
+            "detail": (create_resp.text or create_resp.reason)[:500],
+            "messages": [],
+        }
+
+    search_id = create_resp.json().get("id")
+    if not search_id:
+        return {
+            "ok": False,
+            "status": create_resp.status_code,
+            "detail": "Views search created but no search id returned",
+            "messages": [],
+        }
+
+    exec_resp = requests.post(
+        f"{base_url}/api/views/search/{search_id}/execute",
+        headers=headers,
+        auth=auth,
+        json={},
+        verify=verify_ssl,
+        timeout=60,
+    )
+    if not exec_resp.ok:
+        return {
+            "ok": False,
+            "status": exec_resp.status_code,
+            "detail": (exec_resp.text or exec_resp.reason)[:500],
+            "messages": [],
+        }
+
+    exec_data = exec_resp.json()
+    query_result = (exec_data.get("results") or {}).get("query-1") or {}
+    search_type = (query_result.get("search_types") or {}).get("messages-1") or {}
+    messages = search_type.get("messages") or []
+    total = search_type.get("total_results")
+
+    return {
+        "ok": True,
+        "status": exec_resp.status_code,
+        "detail": None,
+        "messages": messages,
+        "total_results": total,
+        "api": "views",
+    }
+
+def _search_graylog_legacy_api(base_url, headers, auth, verify_ssl, query, from_time, to_time, limit):
+    """Fallback for older GrayLog that still exposes /api/search/universal/absolute."""
+    url = f"{base_url}/api/search/universal/absolute"
+    params = {
+        "query": query,
+        "from": from_time,
+        "to": to_time,
+        "decorate": "true",
+        "limit": limit,
+    }
+    response = requests.get(
+        url,
+        params=params,
+        headers=headers,
+        auth=auth,
+        verify=verify_ssl,
+        timeout=30,
+    )
+    if not response.ok:
+        return {
+            "ok": False,
+            "status": response.status_code,
+            "detail": (response.text or response.reason)[:500],
+            "messages": [],
+        }
+
+    messages = response.json().get("messages", [])
+    return {
+        "ok": True,
+        "status": response.status_code,
+        "detail": None,
+        "messages": messages,
+        "api": "legacy",
+    }
+
+def search_graylog_by_uuid(uuid, graylog_config, days_back=7, limit=100):
+    """
+    Search GrayLog for a UUID. Prefer Views API (GrayLog 4.x UI), fall back to legacy.
+    Auth/connectivity failures are returned as error instead of empty results.
+    """
+    to_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    from_time = (datetime.utcnow() - timedelta(days=days_back)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+    base_url = (graylog_config.get('GRAYLOG_BASE_URL') or '').rstrip('/')
+    username = graylog_config.get('GRAYLOG_USERNAME') or ''
+    password = graylog_config.get('GRAYLOG_PASSWORD') or ''
+    verify_ssl = False if base_url.startswith('https://') else True
+    auth = (username, password)
+
+    queries = [
+        f'UUID:"{uuid}"',
+        f'"{uuid}"',
+        f'uuid:{uuid}',
+    ]
+
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'X-Requested-By': 'JalinApps',
+    }
+
+    all_messages = []
+    successful_queries = []
+    query_errors = []
+    auth_error = None
+    used_api = None
+
+    for query in queries:
+        if auth_error:
+            break
+
+        print(f"[DEBUG] Trying GrayLog query via Views API: {query}")
+        try:
+            result = _search_graylog_views_api(
+                base_url, headers, auth, verify_ssl, query, from_time, to_time, limit
+            )
+
+            # If Views endpoint itself is missing, fall back to legacy once
+            if not result["ok"] and result.get("status") == 404:
+                print("[DEBUG] Views API not available, falling back to legacy absolute search")
+                result = _search_graylog_legacy_api(
+                    base_url, headers, auth, verify_ssl, query, from_time, to_time, limit
+                )
+
+            if result["ok"]:
+                used_api = result.get("api") or used_api or "views"
+                successful_queries.append(query)
+                messages = result.get("messages") or []
+                if messages:
+                    all_messages.extend(messages)
+                    print(
+                        f"[DEBUG] Found {len(messages)} messages "
+                        f"(total_results={result.get('total_results')}) with query: {query}"
+                    )
+                    # Primary UUID query already matched — stop early
+                    if query.startswith('UUID:'):
+                        break
+                else:
+                    print(f"[DEBUG] No messages found with query: {query}")
+            else:
+                query_errors.append({
+                    'query': query,
+                    'status': result.get('status'),
+                    'detail': result.get('detail'),
+                })
+                print(f"[DEBUG] GrayLog error for '{query}': {result.get('status')} {result.get('detail')}")
+                if result.get('status') in (401, 403):
+                    auth_error = (
+                        f"GrayLog menolak akses search API (HTTP {result.get('status')}). "
+                        f"User '{username}' di {base_url}. Detail: {result.get('detail')}"
+                    )
+        except requests.exceptions.RequestException as e:
+            query_errors.append({'query': query, 'status': None, 'detail': str(e)})
+            print(f"[DEBUG] Request error with query '{query}': {e}")
+            auth_error = f"Tidak bisa terhubung ke GrayLog di {base_url}: {e}"
+            break
+        except Exception as e:
+            query_errors.append({'query': query, 'status': None, 'detail': str(e)})
+            print(f"[DEBUG] Error with query '{query}': {e}")
+            continue
+
+    unique_messages = _dedupe_graylog_messages(all_messages)
+
+    return {
+        'messages': unique_messages,
+        'successful_queries': successful_queries,
+        'queries_tried': queries,
+        'query_errors': query_errors,
+        'error': auth_error,
+        'api_used': used_api,
+        'time_range': {
+            'from': from_time,
+            'to': to_time,
+            'days_back': days_back,
+        },
+        'graylog_url': base_url,
+        'graylog_username': username,
+    }
+
+def build_graylog_response(uuid, connection, days_back, limit, include_rules):
+    """Shared handler body for GET/POST graylog data endpoints."""
+    print(f"[DEBUG] Searching GrayLog for UUID: {uuid}")
+    print(f"[DEBUG] Connection: {connection}, days_back={days_back}, include_rules={include_rules}")
+
+    graylog_config = get_graylog_config(connection)
+    rules = get_graylog_rules() if include_rules else []
+    if include_rules:
+        print(f"[DEBUG] Loaded {len(rules)} active rules")
+
+    search_result = search_graylog_by_uuid(
+        uuid=uuid,
+        graylog_config=graylog_config,
+        days_back=days_back,
+        limit=limit,
+    )
+
+    if search_result.get('error') and not search_result.get('messages'):
+        return jsonify({
+            'success': False,
+            'error': search_result['error'],
+            'data': {
+                'uuid': uuid,
+                'connection': connection,
+                'graylog_url': search_result.get('graylog_url'),
+                'graylog_username': search_result.get('graylog_username'),
+                'time_range': search_result.get('time_range'),
+                'query_errors': search_result.get('query_errors', []),
+                'total_messages': 0,
+                'messages': [],
+            }
+        }), 403 if 'permission' in (search_result['error'] or '').lower() or '403' in (search_result['error'] or '') else 502
+
+    enhanced_messages = []
+    messages_with_rules = 0
+    for message in search_result['messages']:
+        if include_rules and rules:
+            enhanced_message = enhance_message_with_rules(message, rules)
+            if enhanced_message.get('has_rules'):
+                messages_with_rules += 1
+            enhanced_messages.append(enhanced_message)
+        else:
+            enhanced_messages.append(message)
+
+    print(f"[DEBUG] Total unique messages found: {len(enhanced_messages)}")
+
+    return jsonify({
+        'success': True,
+        'data': {
+            'uuid': uuid,
+            'connection': connection,
+            'rules': rules if include_rules else [],
+            'time_range': search_result['time_range'],
+            'total_messages': len(enhanced_messages),
+            'messages': enhanced_messages,
+            'successful_queries': search_result['successful_queries'],
+            'search_info': {
+                'queries_tried': search_result['queries_tried'],
+                'successful_queries': search_result['successful_queries'],
+                'query_errors': search_result.get('query_errors', []),
+                'total_raw_messages': len(search_result['messages']),
+                'total_unique_messages': len(enhanced_messages),
+                'rules_applied': include_rules,
+                'total_rules_loaded': len(rules),
+                'messages_with_rules': messages_with_rules,
+                'graylog_url': search_result.get('graylog_url'),
+                'graylog_username': search_result.get('graylog_username'),
+            }
+        }
+    })
+
 @graylog_data_bp.route('/', methods=['GET'])
 def get_graylog_data():
     """Get GrayLog data for a specific UUID"""
     try:
-        # Get parameters
         uuid = request.args.get('uuid')
         connection = request.args.get('connection', 'LOKAL')
-        days_back = request.args.get('days_back', 2, type=int)
+        days_back = request.args.get('days_back', 7, type=int)
         limit = request.args.get('limit', 100, type=int)
         include_rules = request.args.get('include_rules', 'true').lower() == 'true'
-        
+
         if not uuid:
             return jsonify({
                 'success': False,
                 'error': 'UUID parameter is required'
             }), 400
-        
-        # Calculate time range in UTC
-        to_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        from_time = (datetime.utcnow() - timedelta(days=days_back)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        
-        print(f"[DEBUG] Searching GrayLog for UUID: {uuid}")
-        print(f"[DEBUG] Time range (UTC): {from_time} to {to_time}")
-        print(f"[DEBUG] Connection: {connection}")
-        print(f"[DEBUG] Include rules: {include_rules}")
-        
-        # Get GrayLog configuration
-        graylog_config = get_graylog_config(connection)
-        
-        # Fetch GrayLog rules if requested
-        rules = []
-        if include_rules:
-            rules = get_graylog_rules()
-            print(f"[DEBUG] Loaded {len(rules)} active rules")
-        
-        # Construct GrayLog API URL
-        url = f"{graylog_config['GRAYLOG_BASE_URL']}/api/search/universal/absolute"
-        
-        # Try multiple query formats for UUID search
-        queries = [
-            f'UUID:"{uuid}"',  # Standard UUID field search
-            f'Message UUID: {uuid}',  # Message UUID format
-            f'uuid:{uuid}',  # Lowercase uuid field
-            f'"{uuid}"'  # Simple string search
-        ]
-        
-        all_messages = []
-        successful_queries = []
-        
-        for query in queries:
-            try:
-                # Set up the query parameters
-                params = {
-                    'query': query,
-                    'from': from_time,
-                    'to': to_time,
-                    'decorate': 'true',
-                    'limit': limit
-                }
-                
-                # Set up headers with Basic Authentication
-                headers = {
-                    'Accept': 'application/json'
-                }
-                
-                # Determine if SSL verification should be disabled
-                verify_ssl = False if graylog_config['GRAYLOG_BASE_URL'].startswith('https://') else True
-                
-                # Print full URL with parameters for debugging
-                full_url = f"{url}?{urlencode(params)}"
-                print(f"[DEBUG] Trying query: {query}")
-                print(f"[DEBUG] Full Graylog URL: {full_url}")
-                
-                # Make request to GrayLog using Basic Auth
-                response = requests.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    auth=(graylog_config['GRAYLOG_USERNAME'], graylog_config['GRAYLOG_PASSWORD']),
-                    verify=verify_ssl,
-                    timeout=30
-                )
-                
-                print(f"[DEBUG] Response status for query '{query}': {response.status_code}")
-                
-                if response.ok:
-                    response_data = response.json()
-                    messages = response_data.get('messages', [])
-                    
-                    if messages:
-                        all_messages.extend(messages)
-                        successful_queries.append(query)
-                        print(f"[DEBUG] Found {len(messages)} messages with query: {query}")
-                        # Don't break - collect all messages from all successful queries
-                    else:
-                        print(f"[DEBUG] No messages found with query: {query}")
-                else:
-                    print(f"[DEBUG] Error response for query '{query}': {response.text}")
-                    
-            except Exception as e:
-                print(f"[DEBUG] Error with query '{query}': {str(e)}")
-                continue
-        
-        # Remove duplicates based on message ID
-        unique_messages = []
-        seen_ids = set()
-        for message in all_messages:
-            # Access the message ID from the nested message structure
-            message_data = message.get('message', {})
-            message_id = message_data.get('_id') or message_data.get('gl2_message_id')
-            if message_id and message_id not in seen_ids:
-                unique_messages.append(message)
-                seen_ids.add(message_id)
-            elif not message_id:
-                # If no message ID found, include the message anyway
-                unique_messages.append(message)
-        
-        # Apply rules to messages if requested
-        enhanced_messages = []
-        messages_with_rules = 0
-        
-        for message in unique_messages:
-            if include_rules and rules:
-                enhanced_message = enhance_message_with_rules(message, rules)
-                if enhanced_message['has_rules']:
-                    messages_with_rules += 1
-                enhanced_messages.append(enhanced_message)
-            else:
-                enhanced_messages.append(message)
-        
-        print(f"[DEBUG] Total unique messages found: {len(enhanced_messages)}")
-        if include_rules:
-            print(f"[DEBUG] Messages with matching rules: {messages_with_rules}")
-        
-        return jsonify({
-            'success': True,
-            'data': {
-                'uuid': uuid,
-                'connection': connection,
-                'rules': rules if include_rules else [],
-                'time_range': {
-                    'from': from_time,
-                    'to': to_time,
-                    'days_back': days_back
-                },
-                'total_messages': len(enhanced_messages),
-                'messages': enhanced_messages,
-                'successful_queries': successful_queries,
-                'search_info': {
-                    'queries_tried': queries,
-                    'successful_queries': successful_queries,
-                    'total_raw_messages': len(all_messages),
-                    'total_unique_messages': len(enhanced_messages),
-                    'rules_applied': include_rules,
-                    'total_rules_loaded': len(rules),
-                    'messages_with_rules': messages_with_rules
-                }
-            }
-        })
-        
+
+        return build_graylog_response(uuid, connection, days_back, limit, include_rules)
+
     except requests.exceptions.RequestException as e:
-        # If connection error, return error response
         print(f"[DEBUG] Request exception: {str(e)}")
         return jsonify({
             'success': False,
             'error': f'Error communicating with GrayLog: {str(e)}'
         }), 500
-    
+
     except Exception as e:
         print(f"[DEBUG] Unexpected exception: {str(e)}")
         traceback.print_exc()
@@ -393,171 +559,28 @@ def get_graylog_data_post():
                 'success': False,
                 'error': 'No data provided'
             }), 400
-        
-        # Get parameters from request body
+
         uuid = data.get('uuid')
         connection = data.get('connection', 'LOKAL')
-        days_back = data.get('days_back', 2)
+        days_back = data.get('days_back', 7)
         limit = data.get('limit', 100)
         include_rules = data.get('include_rules', True)
-        
+
         if not uuid:
             return jsonify({
                 'success': False,
                 'error': 'UUID parameter is required'
             }), 400
-        
-        # Calculate time range in UTC
-        to_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        from_time = (datetime.utcnow() - timedelta(days=days_back)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        
-        print(f"[DEBUG] POST: Searching GrayLog for UUID: {uuid}")
-        print(f"[DEBUG] POST: Time range (UTC): {from_time} to {to_time}")
-        print(f"[DEBUG] POST: Connection: {connection}")
-        print(f"[DEBUG] POST: Include rules: {include_rules}")
-        
-        # Get GrayLog configuration
-        graylog_config = get_graylog_config(connection)
-        
-        # Fetch GrayLog rules if requested
-        rules = []
-        if include_rules:
-            rules = get_graylog_rules()
-            print(f"[DEBUG] POST: Loaded {len(rules)} active rules")
-        
-        # Construct GrayLog API URL
-        url = f"{graylog_config['GRAYLOG_BASE_URL']}/api/search/universal/absolute"
-        
-        # Try multiple query formats for UUID search
-        queries = [
-            f'UUID:"{uuid}"',  # Standard UUID field search
-            f'Message UUID: {uuid}',  # Message UUID format
-            f'uuid:{uuid}',  # Lowercase uuid field
-            f'"{uuid}"'  # Simple string search
-        ]
-        
-        all_messages = []
-        successful_queries = []
-        
-        for query in queries:
-            try:
-                # Set up the query parameters
-                params = {
-                    'query': query,
-                    'from': from_time,
-                    'to': to_time,
-                    'decorate': 'true',
-                    'limit': limit
-                }
-                
-                # Set up headers with Basic Authentication
-                headers = {
-                    'Accept': 'application/json'
-                }
-                
-                # Determine if SSL verification should be disabled
-                verify_ssl = False if graylog_config['GRAYLOG_BASE_URL'].startswith('https://') else True
-                
-                # Print full URL with parameters for debugging
-                full_url = f"{url}?{urlencode(params)}"
-                print(f"[DEBUG] POST: Trying query: {query}")
-                print(f"[DEBUG] POST: Full Graylog URL: {full_url}")
-                
-                # Make request to GrayLog using Basic Auth
-                response = requests.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    auth=(graylog_config['GRAYLOG_USERNAME'], graylog_config['GRAYLOG_PASSWORD']),
-                    verify=verify_ssl,
-                    timeout=30
-                )
-                
-                print(f"[DEBUG] POST: Response status for query '{query}': {response.status_code}")
-                
-                if response.ok:
-                    response_data = response.json()
-                    messages = response_data.get('messages', [])
-                    
-                    if messages:
-                        all_messages.extend(messages)
-                        successful_queries.append(query)
-                        print(f"[DEBUG] POST: Found {len(messages)} messages with query: {query}")
-                        # Don't break - collect all messages from all successful queries
-                    else:
-                        print(f"[DEBUG] POST: No messages found with query: {query}")
-                else:
-                    print(f"[DEBUG] POST: Error response for query '{query}': {response.text}")
-                    
-            except Exception as e:
-                print(f"[DEBUG] POST: Error with query '{query}': {str(e)}")
-                continue
-        
-        # Remove duplicates based on message ID
-        unique_messages = []
-        seen_ids = set()
-        for message in all_messages:
-            # Access the message ID from the nested message structure
-            message_data = message.get('message', {})
-            message_id = message_data.get('_id') or message_data.get('gl2_message_id')
-            if message_id and message_id not in seen_ids:
-                unique_messages.append(message)
-                seen_ids.add(message_id)
-            elif not message_id:
-                # If no message ID found, include the message anyway
-                unique_messages.append(message)
-        
-        # Apply rules to messages if requested
-        enhanced_messages = []
-        messages_with_rules = 0
-        
-        for message in unique_messages:
-            if include_rules and rules:
-                enhanced_message = enhance_message_with_rules(message, rules)
-                if enhanced_message['has_rules']:
-                    messages_with_rules += 1
-                enhanced_messages.append(enhanced_message)
-            else:
-                enhanced_messages.append(message)
-        
-        print(f"[DEBUG] POST: Total unique messages found: {len(enhanced_messages)}")
-        if include_rules:
-            print(f"[DEBUG] POST: Messages with matching rules: {messages_with_rules}")
-        
-        return jsonify({
-            'success': True,
-            'data': {
-                'uuid': uuid,
-                'connection': connection,
-                'rules': rules if include_rules else [],
-                'time_range': {
-                    'from': from_time,
-                    'to': to_time,
-                    'days_back': days_back
-                },
-                'total_messages': len(enhanced_messages),
-                'messages': enhanced_messages,
-                'successful_queries': successful_queries,
-                'search_info': {
-                    'queries_tried': queries,
-                    'successful_queries': successful_queries,
-                    'total_raw_messages': len(all_messages),
-                    'total_unique_messages': len(enhanced_messages),
-                    'rules_applied': include_rules,
-                    'total_rules_loaded': len(rules),
-                    'messages_with_rules': messages_with_rules
-                }
-            }
-        })
-        
+
+        return build_graylog_response(uuid, connection, days_back, limit, include_rules)
+
     except requests.exceptions.RequestException as e:
-        # If connection error, return error response
         print(f"[DEBUG] POST: Request exception: {str(e)}")
         return jsonify({
             'success': False,
             'error': f'Error communicating with GrayLog: {str(e)}'
         }), 500
-    
+
     except Exception as e:
         print(f"[DEBUG] POST: Unexpected exception: {str(e)}")
         traceback.print_exc()
@@ -881,133 +904,74 @@ def options_handler(path):
 def fetch_graylog_data_direct(uuid, connection, days_back=7, limit=100, include_rules=True):
     """Direct function to fetch GrayLog data without Flask request context"""
     try:
-        # Get GrayLog configuration
         config = get_graylog_config(connection)
-        if not config:
+        if not config or not config.get('GRAYLOG_BASE_URL'):
             return {
                 'success': False,
                 'error': f'GrayLog configuration not found for connection: {connection}'
             }
-        
-        # Check if we have the required configuration
-        if not config.get('GRAYLOG_BASE_URL'):
+
+        rules = get_graylog_rules() if include_rules else []
+        search_result = search_graylog_by_uuid(
+            uuid=uuid,
+            graylog_config=config,
+            days_back=days_back,
+            limit=limit,
+        )
+
+        if search_result.get('error') and not search_result.get('messages'):
             return {
                 'success': False,
-                'error': f'GrayLog base URL not found in configuration'
+                'error': search_result['error'],
             }
-        
-        # Get GrayLog rules if requested
-        rules = []
-        if include_rules:
-            rules = get_graylog_rules()
-        
-        # Calculate time range in UTC
-        to_time = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        from_time = (datetime.utcnow() - timedelta(days=days_back)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        
-        # Construct GrayLog API URL
-        url = f"{config['GRAYLOG_BASE_URL']}/api/search/universal/absolute"
-        
-        # Try multiple query formats for UUID search
-        queries = [
-            f'UUID:"{uuid}"',  # Standard UUID field search
-            f'Message UUID: {uuid}',  # Message UUID format
-            f'uuid:{uuid}',  # Lowercase uuid field
-            f'"{uuid}"'  # Simple string search
-        ]
-        
-        all_messages = []
-        successful_queries = []
-        
-        for query in queries:
-            try:
-                # Set up the query parameters
-                params = {
-                    'query': query,
-                    'from': from_time,
-                    'to': to_time,
-                    'decorate': 'true',
-                    'limit': limit
-                }
-                
-                # Set up headers with Basic Authentication
-                headers = {
-                    'Accept': 'application/json'
-                }
-                
-                # Determine if SSL verification should be disabled
-                verify_ssl = False if config['GRAYLOG_BASE_URL'].startswith('https://') else True
-                
-                # Make request to GrayLog using Basic Auth
-                response = requests.get(
-                    url,
-                    params=params,
-                    headers=headers,
-                    auth=(config['GRAYLOG_USERNAME'], config['GRAYLOG_PASSWORD']),
-                    verify=verify_ssl,
-                    timeout=30
-                )
-                
-                if response.ok:
-                    response_data = response.json()
-                    messages = response_data.get('messages', [])
-                    
-                    if messages:
-                        all_messages.extend(messages)
-                        successful_queries.append(query)
-                    else:
-                        pass # No else block here, just continue
-                else:
-                    pass # No else block here, just continue
-                    
-            except Exception as e:
-                continue
-        
-        # Remove duplicates based on message ID
+
         unique_messages = {}
-        
-        for msg in all_messages:
+        for msg in search_result.get('messages') or []:
             message_data = msg.get('message', {})
             message_id = message_data.get('_id') or message_data.get('gl2_message_id')
-            
             if message_id and message_id not in unique_messages:
-                unique_messages[message_id] = msg
-        
-        # Enhance messages with rules if requested
-        if include_rules and rules:
-            for message in unique_messages.values():
-                enhanced_message = enhance_message_with_rules(message, rules)
-                message.update(enhanced_message)
-        
-        # Prepare response data
+                if include_rules and rules:
+                    unique_messages[message_id] = enhance_message_with_rules(msg, rules)
+                else:
+                    unique_messages[message_id] = msg
+            elif not message_id:
+                key = f"noid-{len(unique_messages)}"
+                unique_messages[key] = (
+                    enhance_message_with_rules(msg, rules) if include_rules and rules else msg
+                )
+
+        time_range = search_result.get('time_range') or {}
         response_data = {
             'uuid': uuid,
             'connection': connection,
             'rules': rules if include_rules else [],
             'time_range': {
-                'start': from_time,
-                'end': to_time,
-                'days_back': days_back
+                'start': time_range.get('from'),
+                'end': time_range.get('to'),
+                'days_back': days_back,
             },
-            'total_messages': len(unique_messages.values()),
+            'total_messages': len(unique_messages),
             'messages': list(unique_messages.values()),
             'search_info': {
-                'query': f'Multiple queries: {", ".join(successful_queries)}',
-                'total_raw_messages': len(all_messages),
+                'query': f'Multiple queries: {", ".join(search_result.get("successful_queries") or [])}',
+                'api_used': search_result.get('api_used'),
+                'total_raw_messages': len(search_result.get('messages') or []),
                 'total_unique_messages': len(unique_messages),
                 'rules_applied': include_rules,
                 'total_rules_loaded': len(rules) if rules else 0,
-                'messages_with_rules': sum(1 for msg in unique_messages.values() if msg.get('has_rules', False))
-            }
+                'messages_with_rules': sum(
+                    1 for msg in unique_messages.values() if msg.get('has_rules', False)
+                ),
+            },
         }
-        
+
         return {
             'success': True,
-            'data': response_data
+            'data': response_data,
         }
-        
+
     except Exception as e:
         return {
             'success': False,
-            'error': f'Error fetching GrayLog data: {str(e)}'
+            'error': f'Error fetching GrayLog data: {str(e)}',
         }

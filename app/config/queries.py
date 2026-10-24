@@ -65,6 +65,9 @@ RNA_TRANSACTION_QUERY = '''
         trx.participant_iss_id AS 'Iss ID',  
         (SELECT content FROM transaction_attr   
         WHERE transaction_id = trx.id AND field = 'IN.GATEWAY_ID' LIMIT 1) AS 'Gateway ID',  
+        (SELECT bg.name FROM bin_gateway bg
+         INNER JOIN transaction_attr ta ON ta.content = bg.id
+         WHERE ta.transaction_id = trx.id AND ta.field = 'IN.GATEWAY_ID' LIMIT 1) AS 'Gateway Name',
         (SELECT content FROM transaction_attr   
         WHERE transaction_id = trx.id AND field = 'IR.PRINCIPALS_CODE' LIMIT 1) AS 'Principal Code',  
         trx.msgclass AS 'Msg Class',  

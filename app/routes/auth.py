@@ -29,7 +29,7 @@ def get_user_by_username(username):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT u.id, u.username, u.password, r.role_name, r.id_role, r.can_crud
+        SELECT u.id, u.username, u.password, r.role_name, r.id_role, r.can_crud, u.full_name
         FROM user u
         LEFT JOIN role r ON u.id_role = r.id_role
         WHERE u.username = ?
@@ -44,7 +44,8 @@ def get_user_by_username(username):
             'password': user[2],
             'role_name': user[3],
             'id_role': user[4],
-            'can_crud': bool(user[5])
+            'can_crud': bool(user[5]),
+            'full_name': user[6] or '',
         }
     return None
 
@@ -131,6 +132,7 @@ def login():
             'user': {
                 'id': user_data['id'],
                 'username': user_data['username'],
+                'full_name': user_data.get('full_name') or '',
                 'role_name': user_data['role_name'],
                 'id_role': user_data['id_role'],
                 'can_crud': user_data['can_crud']
@@ -163,15 +165,34 @@ def get_current_user():
                 'success': False,
                 'error': 'Invalid or expired token'
             }), 401
+
+        # Prefer fresh DB data so full_name updates without re-login
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT u.id, u.username, u.full_name, r.role_name, r.id_role, r.can_crud
+            FROM user u
+            LEFT JOIN role r ON u.id_role = r.id_role
+            WHERE u.id = ?
+        ''', (payload['user_id'],))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({
+                'success': False,
+                'error': 'User not found'
+            }), 404
         
         return jsonify({
             'success': True,
             'user': {
-                'id': payload['user_id'],
-                'username': payload['username'],
-                'role_name': payload['role_name'],
-                'id_role': payload['id_role'],
-                'can_crud': payload['can_crud']
+                'id': row[0],
+                'username': row[1],
+                'full_name': row[2] or '',
+                'role_name': row[3],
+                'id_role': row[4],
+                'can_crud': bool(row[5]),
             }
         }), 200
         
@@ -212,7 +233,7 @@ def get_users():
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT u.id, u.username, r.role_name, r.can_crud, u.last_login
+            SELECT u.id, u.username, u.full_name, r.role_name, r.id_role, r.can_crud, u.last_login
             FROM user u
             LEFT JOIN role r ON u.id_role = r.id_role
             ORDER BY u.id
@@ -225,9 +246,11 @@ def get_users():
             user_list.append({
                 'id': user[0],
                 'username': user[1],
-                'role_name': user[2],
-                'can_crud': bool(user[3]),
-                'last_login': user[4]
+                'full_name': user[2] or '',
+                'role_name': user[3],
+                'id_role': user[4],
+                'can_crud': bool(user[5]),
+                'last_login': user[6]
             })
         
         return jsonify({
@@ -331,13 +354,13 @@ def get_pages():
         
         # Get all pages with their assigned roles
         cursor.execute('''
-            SELECT p.id_page, p.name, p.path, p.page_order, p.icon,
+            SELECT p.id_page, p.name, p.path, p.page_order, p.icon, p.parent_id,
                    GROUP_CONCAT(r.role_name) as role_names,
                    GROUP_CONCAT(r.id_role) as role_ids
             FROM page p
             LEFT JOIN page_role pr ON p.id_page = pr.id_page
             LEFT JOIN role r ON pr.id_role = r.id_role
-            GROUP BY p.id_page, p.name, p.path, p.page_order, p.icon
+            GROUP BY p.id_page, p.name, p.path, p.page_order, p.icon, p.parent_id
             ORDER BY p.page_order ASC, p.name ASC
         ''')
         pages = cursor.fetchall()
@@ -345,8 +368,8 @@ def get_pages():
         
         page_list = []
         for page in pages:
-            role_names = page[5].split(',') if page[5] else []
-            role_ids = [int(x) for x in page[6].split(',')] if page[6] else []
+            role_names = page[6].split(',') if page[6] else []
+            role_ids = [int(x) for x in page[7].split(',')] if page[7] else []
             
             page_list.append({
                 'id_page': page[0],
@@ -354,6 +377,7 @@ def get_pages():
                 'path': page[2],
                 'page_order': page[3],
                 'icon': page[4],
+                'parent_id': page[5],
                 'role_names': role_names,
                 'role_ids': role_ids
             })
@@ -397,24 +421,56 @@ def get_user_pages():
         
         # Get pages accessible to user's role
         cursor.execute('''
-            SELECT DISTINCT p.id_page, p.name, p.path, p.page_order, p.icon
+            SELECT DISTINCT p.id_page, p.name, p.path, p.page_order, p.icon, p.parent_id
             FROM page p
             INNER JOIN page_role pr ON p.id_page = pr.id_page
             WHERE pr.id_role = ?
             ORDER BY p.page_order ASC, p.name ASC
         ''', (user_role_id,))
         pages = cursor.fetchall()
-        conn.close()
-        
-        page_list = []
+
+        # Also include parent menu pages for accessible children
+        # so nested menus still render even if parent role was omitted
+        page_map = {}
         for page in pages:
-            page_list.append({
+            page_map[page[0]] = {
                 'id_page': page[0],
                 'name': page[1],
                 'path': page[2],
                 'page_order': page[3],
-                'icon': page[4]
-            })
+                'icon': page[4],
+                'parent_id': page[5],
+            }
+
+        parent_ids = {
+            page['parent_id']
+            for page in page_map.values()
+            if page.get('parent_id')
+        }
+        missing_parent_ids = [pid for pid in parent_ids if pid not in page_map]
+        if missing_parent_ids:
+            placeholders = ','.join('?' * len(missing_parent_ids))
+            cursor.execute(f'''
+                SELECT id_page, name, path, page_order, icon, parent_id
+                FROM page
+                WHERE id_page IN ({placeholders})
+            ''', missing_parent_ids)
+            for parent in cursor.fetchall():
+                page_map[parent[0]] = {
+                    'id_page': parent[0],
+                    'name': parent[1],
+                    'path': parent[2],
+                    'page_order': parent[3],
+                    'icon': parent[4],
+                    'parent_id': parent[5],
+                }
+
+        conn.close()
+
+        page_list = sorted(
+            page_map.values(),
+            key=lambda p: (p.get('page_order') or 0, p.get('name') or '')
+        )
         
         return jsonify({
             'success': True,
@@ -697,6 +753,7 @@ def create_user():
         username = data['username']
         password = data['password']
         id_role = data['id_role']
+        full_name = (data.get('full_name') or '').strip()
         
         # Hash password
         hashed_password = hash_password(password)
@@ -725,8 +782,8 @@ def create_user():
         
         # Create user
         cursor.execute(
-            "INSERT INTO user (username, password, id_role) VALUES (?, ?, ?)",
-            (username, hashed_password, id_role)
+            "INSERT INTO user (username, password, id_role, full_name) VALUES (?, ?, ?, ?)",
+            (username, hashed_password, id_role, full_name)
         )
         user_id = cursor.lastrowid
         conn.commit()
@@ -738,6 +795,7 @@ def create_user():
             'user': {
                 'id': user_id,
                 'username': username,
+                'full_name': full_name,
                 'role_name': role_result[0],
                 'id_role': id_role
             }
@@ -806,6 +864,10 @@ def update_user(user_id):
                 }), 400
             update_fields.append("username = ?")
             update_values.append(data['username'])
+
+        if 'full_name' in data:
+            update_fields.append("full_name = ?")
+            update_values.append((data.get('full_name') or '').strip())
         
         if 'id_role' in data:
             # Check if role exists
@@ -820,7 +882,7 @@ def update_user(user_id):
             update_fields.append("id_role = ?")
             update_values.append(data['id_role'])
         
-        if 'password' in data:
+        if 'password' in data and data['password']:
             hashed_password = hash_password(data['password'])
             update_fields.append("password = ?")
             update_values.append(hashed_password)
@@ -839,7 +901,7 @@ def update_user(user_id):
         
         # Get updated user data
         cursor.execute('''
-            SELECT u.id, u.username, r.role_name, r.id_role
+            SELECT u.id, u.username, u.full_name, r.role_name, r.id_role
             FROM user u
             LEFT JOIN role r ON u.id_role = r.id_role
             WHERE u.id = ?
@@ -853,8 +915,9 @@ def update_user(user_id):
             'user': {
                 'id': user[0],
                 'username': user[1],
-                'role_name': user[2],
-                'id_role': user[3]
+                'full_name': user[2] or '',
+                'role_name': user[3],
+                'id_role': user[4]
             }
         }), 200
         
@@ -1192,6 +1255,17 @@ def create_page():
         role_ids = data.get('role_ids', [])  # Optional role assignments
         page_order = data.get('page_order', 0)  # Optional page order
         icon = data.get('icon')  # Optional icon
+        parent_id = data.get('parent_id')  # Optional parent menu
+        if parent_id in ('', None):
+            parent_id = None
+        else:
+            try:
+                parent_id = int(parent_id)
+            except (TypeError, ValueError):
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid parent_id'
+                }), 400
         
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1204,11 +1278,31 @@ def create_page():
                 'success': False,
                 'error': 'Page path already exists'
             }), 400
+
+        # Validate parent menu (one-level nesting only)
+        if parent_id is not None:
+            cursor.execute(
+                "SELECT id_page, parent_id FROM page WHERE id_page = ?",
+                (parent_id,)
+            )
+            parent_row = cursor.fetchone()
+            if not parent_row:
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'Parent page not found'
+                }), 400
+            if parent_row[1] is not None:
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'Nested submenus deeper than one level are not allowed'
+                }), 400
         
         # Create page
         cursor.execute(
-            "INSERT INTO page (name, path, page_order, icon) VALUES (?, ?, ?, ?)",
-            (name, path, page_order, icon)
+            "INSERT INTO page (name, path, page_order, icon, parent_id) VALUES (?, ?, ?, ?, ?)",
+            (name, path, page_order, icon, parent_id)
         )
         page_id = cursor.lastrowid
         
@@ -1243,6 +1337,7 @@ def create_page():
                 'path': path,
                 'page_order': page_order,
                 'icon': icon,
+                'parent_id': parent_id,
                 'role_ids': role_ids
             }
         }), 201
@@ -1322,6 +1417,61 @@ def update_page(page_id):
         if 'icon' in data:
             update_fields.append("icon = ?")
             update_values.append(data['icon'])
+
+        if 'parent_id' in data:
+            parent_id = data.get('parent_id')
+            if parent_id in ('', None):
+                parent_id = None
+            else:
+                try:
+                    parent_id = int(parent_id)
+                except (TypeError, ValueError):
+                    conn.close()
+                    return jsonify({
+                        'success': False,
+                        'error': 'Invalid parent_id'
+                    }), 400
+
+            if parent_id == page_id:
+                conn.close()
+                return jsonify({
+                    'success': False,
+                    'error': 'A page cannot be its own parent'
+                }), 400
+
+            if parent_id is not None:
+                cursor.execute(
+                    "SELECT id_page, parent_id FROM page WHERE id_page = ?",
+                    (parent_id,)
+                )
+                parent_row = cursor.fetchone()
+                if not parent_row:
+                    conn.close()
+                    return jsonify({
+                        'success': False,
+                        'error': 'Parent page not found'
+                    }), 400
+                if parent_row[1] is not None:
+                    conn.close()
+                    return jsonify({
+                        'success': False,
+                        'error': 'Nested submenus deeper than one level are not allowed'
+                    }), 400
+
+                # Prevent turning a parent with children into a child
+                cursor.execute(
+                    "SELECT COUNT(*) FROM page WHERE parent_id = ?",
+                    (page_id,)
+                )
+                if cursor.fetchone()[0] > 0:
+                    conn.close()
+                    return jsonify({
+                        'success': False,
+                        'error': 'This page already has children and cannot become a submenu'
+                    }), 400
+
+            update_fields.append("parent_id = ?")
+            update_values.append(parent_id)
         
         if update_fields:
             update_values.append(page_id)
@@ -1356,20 +1506,20 @@ def update_page(page_id):
         
         # Get updated page data with roles
         cursor.execute('''
-            SELECT p.id_page, p.name, p.path, p.page_order, p.icon,
+            SELECT p.id_page, p.name, p.path, p.page_order, p.icon, p.parent_id,
                    GROUP_CONCAT(r.role_name) as role_names,
                    GROUP_CONCAT(r.id_role) as role_ids
             FROM page p
             LEFT JOIN page_role pr ON p.id_page = pr.id_page
             LEFT JOIN role r ON pr.id_role = r.id_role
             WHERE p.id_page = ?
-            GROUP BY p.id_page, p.name, p.path, p.page_order, p.icon
+            GROUP BY p.id_page, p.name, p.path, p.page_order, p.icon, p.parent_id
         ''', (page_id,))
         page = cursor.fetchone()
         conn.close()
         
-        role_names = page[5].split(',') if page[5] else []
-        role_ids = [int(x) for x in page[6].split(',')] if page[6] else []
+        role_names = page[6].split(',') if page[6] else []
+        role_ids = [int(x) for x in page[7].split(',')] if page[7] else []
         
         return jsonify({
             'success': True,
@@ -1380,6 +1530,7 @@ def update_page(page_id):
                 'path': page[2],
                 'page_order': page[3],
                 'icon': page[4],
+                'parent_id': page[5],
                 'role_names': role_names,
                 'role_ids': role_ids
             }
@@ -1430,6 +1581,12 @@ def delete_page(page_id):
                 'success': False,
                 'error': 'Page not found'
             }), 404
+
+        # Detach children before deleting parent menu
+        cursor.execute(
+            "UPDATE page SET parent_id = NULL WHERE parent_id = ?",
+            (page_id,)
+        )
         
         # Delete page
         cursor.execute("DELETE FROM page WHERE id_page = ?", (page_id,))

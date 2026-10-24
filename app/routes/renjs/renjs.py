@@ -30,7 +30,7 @@ renjs_bp = Blueprint('renjs', __name__)
 
 EDITABLE_EXTENSIONS = {
     '.txt', '.renjs', '.md', '.markdown', '.json',
-    '.yml', '.yaml', '.xml', '.conf', '.cfg', '.ini', '.log',
+    '.yml', '.yaml', '.xml', '.xsl', '.xslt', '.conf', '.cfg', '.ini', '.log',
     '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx',
     '.html', '.htm', '.css', '.scss', '.less',
     '.sql', '.py', '.sh', '.bash',
@@ -237,13 +237,16 @@ def read_file():
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
 
+        st = os.stat(path)
         return jsonify({
             'success': True,
             'data': {
                 'path': os.path.realpath(path),
                 'name': os.path.basename(path),
                 'content': content,
-                'size': os.path.getsize(path),
+                'size': st.st_size,
+                'mtime': st.st_mtime,
+                'modified_at': datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
             },
             'execution_time': round(time.time() - t0, 6),
             'error': None,
@@ -284,12 +287,15 @@ def write_file():
         with open(path, 'w', encoding='utf-8', newline='') as f:
             f.write(content if isinstance(content, str) else str(content))
 
+        st = os.stat(path)
         return jsonify({
             'success': True,
             'data': {
                 'path': os.path.realpath(path),
                 'name': os.path.basename(path),
-                'size': os.path.getsize(path),
+                'size': st.st_size,
+                'mtime': st.st_mtime,
+                'modified_at': datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
             },
             'execution_time': round(time.time() - t0, 6),
             'error': None,
@@ -301,6 +307,36 @@ def write_file():
             'error': str(e),
             'details': traceback.format_exc(),
         }), 500
+
+
+@renjs_bp.route('/files/stat', methods=['POST'])
+def stat_file():
+    """Return mtime/size without reading content. Body: { path }"""
+    if not request.is_json:
+        return jsonify({'success': False, 'error': 'Request body must be JSON'}), 400
+    data = request.get_json() or {}
+    path = data.get('path')
+    try:
+        if not path:
+            return jsonify({'success': False, 'error': 'Missing required field: path'}), 400
+        path = os.path.expanduser(path)
+        if not _is_path_allowed(path):
+            return jsonify({'success': False, 'error': 'Path not allowed'}), 403
+        if not os.path.isfile(path):
+            return jsonify({'success': False, 'error': 'File not found'}), 404
+        st = os.stat(path)
+        return jsonify({
+            'success': True,
+            'data': {
+                'path': os.path.realpath(path),
+                'size': st.st_size,
+                'mtime': st.st_mtime,
+                'modified_at': datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S'),
+            },
+            'error': None,
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @renjs_bp.route('/files/delete', methods=['POST'])
