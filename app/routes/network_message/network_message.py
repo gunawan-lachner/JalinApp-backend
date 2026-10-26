@@ -1722,8 +1722,22 @@ def _transaction_from_payload(payload: bytes) -> Dict[str, str]:
     }
 
 
+def _next_spaced_number(raw: str, delta: int) -> Optional[str]:
+    """Increment a fixed ISO field that is numeric or space-padded numeric."""
+    core = raw.strip()
+    if not core.isdigit():
+        return None
+    width = len(raw)
+    core_width = len(core)
+    number = (int(core) + delta) % (10 ** core_width)
+    text = f'{number:0{core_width}d}'
+    if raw.endswith(core):
+        return text.rjust(width)[:width]
+    return (text + raw[core_width:])[:width].ljust(width)
+
+
 def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> str:
-    """Advance DE11 and numeric DE37 so each stress request is a distinct transaction."""
+    """Advance DE11 and DE37 so each stress request is a distinct transaction."""
     parsed = _parse_iso_fields(msg)
     if not parsed:
         return msg
@@ -1732,12 +1746,14 @@ def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> s
     replacements = []
     if run_offset is None:
         run_offset = int(time.time() * 1000) % 100000
+    delta = run_offset + seq
     if 11 in values and values[11].isdigit():
-        stan = (int(values[11]) + run_offset + seq) % 1000000
+        stan = (int(values[11]) + delta) % 1000000
         replacements.append((ranges[11], f'{stan:06d}'))
-    if 37 in values and values[37].isdigit():
-        rrn = (int(values[37]) + run_offset + seq) % (10 ** 12)
-        replacements.append((ranges[37], f'{rrn:012d}'))
+    if 37 in values:
+        rrn = _next_spaced_number(values[37], delta)
+        if rrn is not None:
+            replacements.append((ranges[37], rrn))
     if not replacements:
         return msg
 
