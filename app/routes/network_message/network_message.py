@@ -1620,26 +1620,56 @@ def _iso_field_end(msg: str, idx: int, field_no: int) -> Optional[int]:
     return None
 
 
-def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> str:
-    """Advance DE11 and numeric DE37 so each stress request is a distinct transaction."""
+_PROC_CODE_LABELS = {
+    '00': 'Pembelian',
+    '01': 'Tarik Tunai',
+    '09': 'Pembelian + Tunai',
+    '20': 'Refund',
+    '21': 'Setor Tunai',
+    '30': 'Cek Saldo',
+    '31': 'Cek Saldo',
+    '38': 'Mini Statement',
+    '40': 'Transfer',
+    '50': 'Pembayaran',
+    '92': 'Cek Status',
+    '93': 'Cek Status',
+}
+_MTI_LABELS = {
+    '0100': 'Authorization',
+    '0110': 'Authorization Response',
+    '0200': 'Financial',
+    '0210': 'Financial Response',
+    '0220': 'Financial Advice',
+    '0400': 'Reversal',
+    '0410': 'Reversal Response',
+    '0420': 'Reversal Advice',
+    '0800': 'Network',
+    '0810': 'Network Response',
+}
+MAX_STRESS_ROWS = 5000
+
+
+def _parse_iso_fields(msg: str):
+    """Return MTI, field values, and byte ranges. Fixed fields store their raw value."""
     if not msg or len(msg) < 20 or not msg[:4].isdigit():
-        return msg
+        return None
+    mti = msg[:4]
     idx = 4
     bitmap_hex = msg[idx:idx + 16]
     idx += 16
     try:
         bitmap_bin = ''.join(f'{int(char, 16):04b}' for char in bitmap_hex)
     except ValueError:
-        return msg
+        return None
     if bitmap_bin[:1] == '1':
         secondary = msg[idx:idx + 16]
         if len(secondary) < 16:
-            return msg
+            return None
         idx += 16
         try:
             bitmap_bin += ''.join(f'{int(char, 16):04b}' for char in secondary)
         except ValueError:
-            return msg
+            return None
 
     ranges = {}
     values = {}
@@ -1657,6 +1687,47 @@ def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> s
         idx = end
         if field_no >= 37 and 11 in ranges:
             break
+    return mti, values, ranges
+
+
+def _transaction_from_payload(payload: bytes) -> Dict[str, str]:
+    empty = {'stan': '', 'rrn': '', 'transaction_type': ''}
+    if not payload:
+        return empty
+    try:
+        text = payload.decode('latin-1')
+    except Exception:
+        return empty
+    parsed = _parse_iso_fields(text)
+    if not parsed:
+        return empty
+    mti, values, _ranges = parsed
+    de3 = values.get(3, '')
+    proc = de3[:2] if len(de3) >= 2 and de3[:2].isdigit() else ''
+    label = _PROC_CODE_LABELS.get(proc) or _MTI_LABELS.get(mti, '')
+    if mti[:2] == '04' and label and not label.lower().startswith('reversal'):
+        label = f'Reversal {label}'
+    if proc and label:
+        transaction_type = f'{label} ({proc})'
+    elif label:
+        transaction_type = label
+    elif proc:
+        transaction_type = proc
+    else:
+        transaction_type = mti
+    return {
+        'stan': values.get(11, '').strip(),
+        'rrn': values.get(37, '').strip(),
+        'transaction_type': transaction_type,
+    }
+
+
+def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> str:
+    """Advance DE11 and numeric DE37 so each stress request is a distinct transaction."""
+    parsed = _parse_iso_fields(msg)
+    if not parsed:
+        return msg
+    _mti, values, ranges = parsed
 
     replacements = []
     if run_offset is None:
@@ -1728,6 +1799,7 @@ def _stress_snapshot(job: Dict) -> Dict:
         job_id = job['id']
         mode = job.get('mode', 'count')
         duration_sec = job.get('duration_sec', 0)
+        rows = list(job.get('rows') or [])
 
     elapsed_ms = max(0.0, ((finished or time.perf_counter()) - started) * 1000)
     average = (sum(latencies) / len(latencies)) if latencies else 0.0
@@ -1752,6 +1824,8 @@ def _stress_snapshot(job: Dict) -> Dict:
         'errors': [{'message': message, 'count': count} for message, count in errors],
         'target': target,
         'protocol': protocol,
+        'rows': rows,
+        'rows_truncated': completed > len(rows),
     }
 
 
@@ -1786,11 +1860,14 @@ def _run_stress_job(job: Dict, packet: Dict, increment_stan: bool):
                     return
                 seq = job['next_index']
                 job['next_index'] += 1
+            sent_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             started = time.perf_counter()
             ok = False
             message = 'Error'
+            identity = {'stan': '', 'rrn': '', 'transaction_type': ''}
             try:
                 payload = _payload_for_sequence(packet, seq, increment_stan, job.get('stan_offset'))
+                identity = _transaction_from_payload(payload)
                 ok, message = packet_sender.send_quiet(packet, payload)
             except Exception as exc:
                 ok = False
@@ -1799,6 +1876,15 @@ def _run_stress_job(job: Dict, packet: Dict, increment_stan: bool):
             with job['lock']:
                 job['completed'] += 1
                 _remember_latency(job, elapsed)
+                if len(job.get('rows', [])) < MAX_STRESS_ROWS:
+                    job.setdefault('rows', []).append({
+                        'time': sent_at,
+                        'stan': identity['stan'],
+                        'rrn': identity['rrn'],
+                        'transaction_type': identity['transaction_type'],
+                        'success': ok,
+                        'latency_ms': round(elapsed, 1),
+                    })
                 if ok:
                     job['success_count'] += 1
                 else:
@@ -1955,6 +2041,7 @@ def start_stress_test():
                 'concurrency': concurrency,
                 'delay_ms': delay_ms,
                 'stan_offset': int(uuid.uuid4().int % 100000),
+                'rows': [],
             }
             _stress_jobs[job_id] = job
             finished_ids = [key for key, item in _stress_jobs.items() if item['status'] != 'running']
