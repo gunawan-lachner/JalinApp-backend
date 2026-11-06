@@ -17,6 +17,8 @@ from typing import List, Dict, Optional, Tuple
 from flask import Blueprint, request, jsonify
 import threading
 
+from app.utils.nsiccs_cryptogram import simulate_de55, verify_public_vector
+
 # Database path
 DATABASE_FILE = os.path.join('instance', 'myapp_db.db')
 
@@ -1586,10 +1588,14 @@ _ISO_FIXED_LEN = {
     19: 3, 20: 3, 21: 3, 22: 3, 23: 3, 24: 3, 25: 2, 26: 2, 27: 1,
     28: 9, 29: 9, 30: 9, 31: 9,
     37: 12, 38: 6, 39: 2, 40: 3, 41: 8, 42: 15, 43: 40,
-    49: 3, 50: 3, 51: 3, 52: 8, 53: 16, 64: 8,
+    # PIN block is 8 bytes shown as 16 hex ASCII characters in this traffic.
+    49: 3, 50: 3, 51: 3, 52: 16, 53: 16, 64: 8,
 }
 _ISO_LLVAR = {2, 32, 33, 34, 35, 44, 45}
-_ISO_LLLVAR = {36, 46, 47, 48, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63}
+_ISO_LLLVAR = {
+    36, 46, 47, 48, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+    120, 121, 122, 123, 124, 125, 126, 127,
+}
 
 _stress_jobs: Dict[str, Dict] = {}
 _stress_jobs_lock = threading.Lock()
@@ -1650,7 +1656,7 @@ MAX_STRESS_ROWS = 5000
 
 
 def _parse_iso_fields(msg: str):
-    """Return MTI, field values, and byte ranges. Fixed fields store their raw value."""
+    """Return MTI, field values, and byte ranges. Variable fields keep their LL/LLL prefix."""
     if not msg or len(msg) < 20 or not msg[:4].isdigit():
         return None
     mti = msg[:4]
@@ -1677,7 +1683,7 @@ def _parse_iso_fields(msg: str):
         if bitmap_bin[bit_index] != '1':
             continue
         field_no = bit_index + 1
-        if field_no > 64:
+        if field_no > 128:
             break
         end = _iso_field_end(msg, idx, field_no)
         if end is None:
@@ -1685,13 +1691,138 @@ def _parse_iso_fields(msg: str):
         values[field_no] = msg[idx:end]
         ranges[field_no] = (idx, end)
         idx = end
-        if field_no >= 37 and 11 in ranges:
-            break
     return mti, values, ranges
 
 
+def _field_body(field_no: int, raw: str) -> str:
+    if field_no in _ISO_LLVAR:
+        return raw[2:] if len(raw) >= 2 else ''
+    if field_no in _ISO_LLLVAR:
+        return raw[3:] if len(raw) >= 3 else ''
+    return raw
+
+
+def _bits_to_hex(bits: str) -> str:
+    if len(bits) % 4 != 0:
+        bits = bits.ljust((len(bits) + 3) // 4 * 4, '0')
+    return ''.join(f'{int(bits[i:i + 4], 2):X}' for i in range(0, len(bits), 4))
+
+
+def _apply_iso_only(msg: str) -> str:
+    """Strip DE55 and set DE22 to magstripe (801). Saved packet content is unchanged by callers."""
+    parsed = _parse_iso_fields(msg)
+    if not parsed:
+        return msg
+    mti, values, _ranges = parsed
+    values = dict(values)
+    values.pop(55, None)
+    # Magstripe POS entry mode used by existing magstripe packets in this app.
+    if 22 in values or True:
+        values[22] = '801'
+
+    present = sorted(values)
+    needs_secondary = any(field_no > 64 for field_no in present)
+    bit_count = 128 if needs_secondary else 64
+    bits = ['0'] * bit_count
+    if needs_secondary:
+        bits[0] = '1'
+    for field_no in present:
+        if 1 < field_no <= bit_count:
+            bits[field_no - 1] = '1'
+
+    primary_hex = _bits_to_hex(''.join(bits[:64]))
+    secondary_hex = _bits_to_hex(''.join(bits[64:128])) if needs_secondary else ''
+    body = ''.join(values[field_no] for field_no in present)
+    return f'{mti}{primary_hex}{secondary_hex}{body}'
+
+
+def _strip_de55(msg: str) -> str:
+    """Backward-compatible alias for ISO Only transform."""
+    return _apply_iso_only(msg)
+
+
+def _read_emv_tag(body: bytes, wanted: bytes) -> Optional[Tuple[int, int, bytes]]:
+    """Return (tag_start, value_start, value_bytes) for the first matching EMV tag."""
+    i = 0
+    while i < len(body):
+        tag_start = i
+        first = body[i]
+        if (first & 0x1F) == 0x1F:
+            if i + 1 >= len(body):
+                return None
+            tag = body[i:i + 2]
+            i += 2
+            while i < len(body) and (body[i - 1] & 0x80):
+                tag += bytes([body[i]])
+                i += 1
+        else:
+            tag = body[i:i + 1]
+            i += 1
+        if i >= len(body):
+            return None
+        length = body[i]
+        i += 1
+        if length & 0x80:
+            n = length & 0x7F
+            if i + n > len(body):
+                return None
+            length = int.from_bytes(body[i:i + n], 'big')
+            i += n
+        if i + length > len(body):
+            return None
+        if tag == wanted:
+            return tag_start, i, body[i:i + length]
+        i += length
+    return None
+
+
+def _bump_emv_atc(de55_raw: str, delta: int, stan: Optional[str] = None) -> Optional[str]:
+    """Increment DE55 ATC (9F36). Optionally sync 9F41 to STAN. Keeps LLL length prefix."""
+    if not de55_raw or len(de55_raw) < 3:
+        return None
+    try:
+        declared = int(de55_raw[:3])
+    except ValueError:
+        return None
+    body = bytearray(de55_raw[3:].encode('latin-1'))
+    if declared != len(body):
+        # Prefer actual body size when length prefix drifted.
+        declared = len(body)
+
+    atc = _read_emv_tag(bytes(body), b'\x9f\x36')
+    if not atc or len(atc[2]) != 2:
+        return None
+    _tag_start, value_start, value = atc
+    current = int.from_bytes(value, 'big')
+    body[value_start:value_start + 2] = ((current + delta) & 0xFFFF).to_bytes(2, 'big')
+
+    if stan and stan.isdigit():
+        counter = _read_emv_tag(bytes(body), b'\x9f\x41')
+        if counter and 1 <= len(counter[2]) <= 4:
+            _cs, cv_start, cv = counter
+            width = len(cv)
+            number = int(stan) % (10 ** (width * 2))
+            # 9F41 is BCD; keep the same byte width.
+            bcd = f'{number:0{width * 2}d}'
+            try:
+                body[cv_start:cv_start + width] = bytes.fromhex(bcd)
+            except ValueError:
+                pass
+
+    new_body = bytes(body).decode('latin-1')
+    return f'{len(new_body):03d}{new_body}'
+
+
+def _extract_atc_hex(de55_raw: str) -> str:
+    body = _field_body(55, de55_raw).encode('latin-1')
+    atc = _read_emv_tag(body, b'\x9f\x36')
+    if not atc:
+        return ''
+    return atc[2].hex().upper()
+
+
 def _transaction_from_payload(payload: bytes) -> Dict[str, str]:
-    empty = {'stan': '', 'rrn': '', 'transaction_type': ''}
+    empty = {'stan': '', 'rrn': '', 'transaction_type': '', 'atc': ''}
     if not payload:
         return empty
     try:
@@ -1715,10 +1846,12 @@ def _transaction_from_payload(payload: bytes) -> Dict[str, str]:
         transaction_type = proc
     else:
         transaction_type = mti
+    atc = _extract_atc_hex(values[55]) if 55 in values else ''
     return {
         'stan': values.get(11, '').strip(),
         'rrn': values.get(37, '').strip(),
         'transaction_type': transaction_type,
+        'atc': atc,
     }
 
 
@@ -1736,8 +1869,13 @@ def _next_spaced_number(raw: str, delta: int) -> Optional[str]:
     return (text + raw[core_width:])[:width].ljust(width)
 
 
-def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> str:
-    """Advance DE11 and DE37 so each stress request is a distinct transaction."""
+def _apply_unique_iso(
+    msg: str,
+    seq: int,
+    run_offset: Optional[int] = None,
+    increment_atc: bool = False,
+) -> str:
+    """Advance STAN/RRN. ATC is optional: bumping it without a new ARQC fails issuer checks."""
     parsed = _parse_iso_fields(msg)
     if not parsed:
         return msg
@@ -1747,13 +1885,18 @@ def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> s
     if run_offset is None:
         run_offset = int(time.time() * 1000) % 100000
     delta = run_offset + seq
+    new_stan = None
     if 11 in values and values[11].isdigit():
-        stan = (int(values[11]) + delta) % 1000000
-        replacements.append((ranges[11], f'{stan:06d}'))
+        new_stan = f'{(int(values[11]) + delta) % 1000000:06d}'
+        replacements.append((ranges[11], new_stan))
     if 37 in values:
         rrn = _next_spaced_number(values[37], delta)
         if rrn is not None:
             replacements.append((ranges[37], rrn))
+    if increment_atc and 55 in values:
+        bumped = _bump_emv_atc(values[55], delta, new_stan or values.get(11, '').strip())
+        if bumped is not None:
+            replacements.append((ranges[55], bumped))
     if not replacements:
         return msg
 
@@ -1763,18 +1906,33 @@ def _apply_unique_iso(msg: str, seq: int, run_offset: Optional[int] = None) -> s
     return updated
 
 
-def _payload_for_sequence(packet: Dict, seq: int, increment_stan: bool, run_offset: Optional[int] = None) -> bytes:
+def _payload_for_sequence(
+    packet: Dict,
+    seq: int,
+    increment_stan: bool,
+    run_offset: Optional[int] = None,
+    increment_atc: bool = False,
+    iso_only: bool = False,
+) -> bytes:
     hex_data = packet.get('hex') or packet.get('hex_data') or ''
     data = packet_sender.hex_to_bytes(hex_data) if hex_data else b''
     if not data:
         ascii_data = packet.get('ascii') or packet.get('ascii_data') or ''
         data = ascii_data.encode('latin-1', errors='ignore')
-    if increment_stan and data:
-        try:
-            text = data.decode('latin-1')
-            data = _apply_unique_iso(text, seq, run_offset).encode('latin-1')
-        except Exception:
-            pass
+    if not data:
+        return data
+    try:
+        text = data.decode('latin-1')
+        if iso_only:
+            text = _strip_de55(text)
+            increment_atc = False
+        if increment_stan:
+            text = _apply_unique_iso(
+                text, seq, run_offset, increment_atc=increment_atc
+            )
+        data = text.encode('latin-1')
+    except Exception:
+        pass
     return data
 
 
@@ -1866,7 +2024,13 @@ def _remember_latency(job: Dict, elapsed: float):
         samples[slot] = elapsed
 
 
-def _run_stress_job(job: Dict, packet: Dict, increment_stan: bool):
+def _run_stress_job(
+    job: Dict,
+    packet: Dict,
+    increment_stan: bool,
+    increment_atc: bool = False,
+    iso_only: bool = False,
+):
     def worker():
         while not job['stop'].is_set():
             with job['lock']:
@@ -1880,9 +2044,16 @@ def _run_stress_job(job: Dict, packet: Dict, increment_stan: bool):
             started = time.perf_counter()
             ok = False
             message = 'Error'
-            identity = {'stan': '', 'rrn': '', 'transaction_type': ''}
+            identity = {'stan': '', 'rrn': '', 'transaction_type': '', 'atc': ''}
             try:
-                payload = _payload_for_sequence(packet, seq, increment_stan, job.get('stan_offset'))
+                payload = _payload_for_sequence(
+                    packet,
+                    seq,
+                    increment_stan,
+                    job.get('stan_offset'),
+                    increment_atc=increment_atc and not iso_only,
+                    iso_only=iso_only,
+                )
                 identity = _transaction_from_payload(payload)
                 ok, message = packet_sender.send_quiet(packet, payload)
             except Exception as exc:
@@ -1897,6 +2068,7 @@ def _run_stress_job(job: Dict, packet: Dict, increment_stan: bool):
                         'time': sent_at,
                         'stan': identity['stan'],
                         'rrn': identity['rrn'],
+                        'atc': identity.get('atc', ''),
                         'transaction_type': identity['transaction_type'],
                         'success': ok,
                         'latency_ms': round(elapsed, 1),
@@ -2004,6 +2176,44 @@ def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, parsed))
 
 
+@network_message_bp.route('/arqc-sim', methods=['POST'], strict_slashes=False)
+def arqc_sim():
+    """Compute an NSICCS ARQC for the current DE55. The saved packet is not updated."""
+    try:
+        if not request.is_json:
+            return jsonify({'success': False, 'error': 'Request body must be JSON'}), 400
+        data = request.get_json() or {}
+        if data.get('self_test'):
+            return jsonify({'success': True, 'data': verify_public_vector()})
+
+        ascii_data = str(data.get('ascii') or '')
+        imk = str(data.get('imk') or '').strip()
+        if not ascii_data.strip():
+            return jsonify({'success': False, 'error': 'Payload ASCII wajib diisi'}), 400
+        if not imk:
+            return jsonify({'success': False, 'error': 'IMK-AC wajib diisi'}), 400
+
+        parsed = _parse_iso_fields(ascii_data)
+        if not parsed or 55 not in parsed[1]:
+            return jsonify({'success': False, 'error': 'Payload tidak berisi DE55'}), 400
+        _mti, values, ranges = parsed
+        raw55 = values[55]
+        if len(raw55) < 4:
+            return jsonify({'success': False, 'error': 'DE55 tidak valid'}), 400
+        pan = _field_body(2, values[2]) if 2 in values else None
+        result = simulate_de55(raw55[3:].encode('latin-1'), imk, pan=pan)
+        new_body = result.pop('de55')
+        new_raw = f'{len(new_body):03d}'.encode('ascii') + new_body
+        start, end = ranges[55]
+        updated = ascii_data[:start] + new_raw.decode('latin-1') + ascii_data[end:]
+        result['ascii'] = updated
+        return jsonify({'success': True, 'data': result})
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 500
+
+
 @network_message_bp.route('/stress-test', methods=['POST'], strict_slashes=False)
 def start_stress_test():
     """Run a bounded burst of the current packet against its configured target."""
@@ -2027,6 +2237,11 @@ def start_stress_test():
             )
         delay_ms = _bounded_int(data.get('delay_ms', 0), 0, 0, MAX_STRESS_DELAY_MS)
         increment_stan = bool(data.get('increment_stan', True))
+        # Default off: bumping ATC without regenerating ARQC yields Invalid ARQC at the issuer.
+        increment_atc = bool(data.get('increment_atc', False))
+        iso_only = bool(data.get('iso_only', False))
+        if iso_only:
+            increment_atc = False
 
         with _stress_jobs_lock:
             if any(job['status'] == 'running' for job in _stress_jobs.values()):
@@ -2067,7 +2282,7 @@ def start_stress_test():
 
         thread = threading.Thread(
             target=_run_stress_job,
-            args=(job, packet, increment_stan),
+            args=(job, packet, increment_stan, increment_atc, iso_only),
             daemon=True,
         )
         thread.start()
