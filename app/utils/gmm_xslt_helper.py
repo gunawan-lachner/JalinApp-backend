@@ -50,6 +50,7 @@ def _normalize_row(row: Dict[str, Any], include_content: bool = False) -> Dict[s
         out["last_mod"] = out["last_mod"].strftime("%Y-%m-%d %H:%M:%S")
     if include_content:
         out["content"] = _decode_blob(row.get("mappingdata"))
+        out["mappingdata"] = out["content"]
         if not out["hash"]:
             out["hash"] = checksum_content(out["content"])
     return out
@@ -231,6 +232,76 @@ def clear_history(conn, mapping_id: int) -> Tuple[bool, Dict[str, Any]]:
     return True, {"mapping_id": mapping_id, "deleted": deleted}
 
 
+COLUMNS_META: List[Dict[str, Any]] = [
+    {
+        "name": "id",
+        "type": "bigint(18) unsigned",
+        "nullable": False,
+        "is_pk": True,
+        "is_auto": False,
+        "is_blob": False,
+        "is_numeric": True,
+        "is_server_only": False,
+    },
+    {
+        "name": "name",
+        "type": "varchar(255)",
+        "nullable": False,
+        "is_pk": False,
+        "is_auto": False,
+        "is_blob": False,
+        "is_numeric": False,
+        "is_server_only": False,
+    },
+    {
+        "name": "usercomment",
+        "type": "varchar(255)",
+        "nullable": False,
+        "is_pk": False,
+        "is_auto": False,
+        "is_blob": False,
+        "is_numeric": False,
+        "is_server_only": False,
+    },
+    {
+        "name": "mappingdata",
+        "type": "blob",
+        "nullable": False,
+        "is_pk": False,
+        "is_auto": False,
+        "is_blob": True,
+        "is_numeric": False,
+        "is_server_only": False,
+    },
+    {
+        "name": "hash",
+        "type": "varchar(32)",
+        "nullable": False,
+        "is_pk": False,
+        "is_auto": False,
+        "is_blob": False,
+        "is_numeric": False,
+        "is_server_only": True,
+    },
+    {
+        "name": "last_mod",
+        "type": "timestamp",
+        "nullable": False,
+        "is_pk": False,
+        "is_auto": False,
+        "is_blob": False,
+        "is_numeric": False,
+        "is_server_only": True,
+    },
+]
+
+COLUMN_NAMES = [c["name"] for c in COLUMNS_META]
+
+
+def columns_meta() -> List[Dict[str, Any]]:
+    return list(COLUMNS_META)
+
+
 def save_mapping(
     conn,
     *,
@@ -254,6 +325,10 @@ def save_mapping(
         if not existing:
             return False, {"error": f"Mapping id {mapping_id} not found"}
 
+        next_name = (name if name is not None else existing.get("name") or "").strip()
+        if not next_name:
+            next_name = existing.get("name") or ""
+
         with conn.cursor() as cursor:
             if _ensure_history_table(conn):
                 _insert_history(
@@ -267,13 +342,14 @@ def save_mapping(
             cursor.execute(
                 f"""
                 UPDATE `{TABLE}`
-                SET mappingdata = %s,
+                SET name = %s,
+                    mappingdata = %s,
                     hash = %s,
                     usercomment = %s,
                     last_mod = CURRENT_TIMESTAMP
                 WHERE id = %s
                 """,
-                (blob, checksum, comment, int(mapping_id)),
+                (next_name, blob, checksum, comment, int(mapping_id)),
             )
         conn.commit()
         saved = get_mapping(conn, int(mapping_id))
@@ -303,3 +379,77 @@ def save_mapping(
             return False, {"error": f"Failed to insert mapping (duplicate id or constraint): {e}"}
 
     return False, {"error": "mode must be 'overwrite' or 'new'"}
+
+
+def update_mapping(
+    conn,
+    mapping_id: int,
+    fields: Dict[str, Any],
+) -> Tuple[bool, Dict[str, Any]]:
+    """Update name / usercomment / mappingdata (content). Hash recomputed server-side."""
+    existing = get_mapping(conn, int(mapping_id))
+    if not existing:
+        return False, {"error": f"Mapping id {mapping_id} not found"}
+
+    fields = fields or {}
+    lower = {str(k).lower(): v for k, v in fields.items()}
+
+    next_name = existing.get("name") or ""
+    if "name" in lower and lower["name"] is not None:
+        next_name = str(lower["name"]).strip() or next_name
+
+    next_comment = existing.get("usercomment") or ""
+    if "usercomment" in lower and lower["usercomment"] is not None:
+        next_comment = str(lower["usercomment"])
+
+    content_changed = False
+    next_content = existing.get("content") or ""
+    for key in ("mappingdata", "content", "mapping_data"):
+        if key in lower and lower[key] is not None:
+            next_content = str(lower[key])
+            content_changed = True
+            break
+
+    checksum = checksum_content(next_content)
+    blob = _encode_blob(next_content)
+
+    with conn.cursor() as cursor:
+        if content_changed and _ensure_history_table(conn):
+            _insert_history(
+                cursor,
+                int(mapping_id),
+                existing.get("content") or "",
+                existing.get("hash") or checksum_content(existing.get("content") or ""),
+                existing.get("usercomment"),
+            )
+        cursor.execute(
+            f"""
+            UPDATE `{TABLE}`
+            SET name = %s,
+                usercomment = %s,
+                mappingdata = %s,
+                hash = %s,
+                last_mod = CURRENT_TIMESTAMP
+            WHERE id = %s
+            """,
+            (next_name, next_comment, blob, checksum, int(mapping_id)),
+        )
+    conn.commit()
+    saved = get_mapping(conn, int(mapping_id))
+    return True, {"mapping": saved}
+
+
+def delete_mapping(conn, mapping_id: int) -> Tuple[bool, Dict[str, Any]]:
+    existing = get_mapping(conn, int(mapping_id))
+    if not existing:
+        return False, {"error": f"Mapping id {mapping_id} not found"}
+
+    with conn.cursor() as cursor:
+        if _ensure_history_table(conn):
+            cursor.execute(
+                f"DELETE FROM `{HISTORY_TABLE}` WHERE mapping_id = %s",
+                (int(mapping_id),),
+            )
+        cursor.execute(f"DELETE FROM `{TABLE}` WHERE id = %s", (int(mapping_id),))
+    conn.commit()
+    return True, {"deleted": True, "id": int(mapping_id), "mapping": existing}
