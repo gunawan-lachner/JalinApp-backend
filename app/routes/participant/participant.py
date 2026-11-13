@@ -236,6 +236,25 @@ def _build_cp_filter_clause(table, column, operator, value):
     return None, []
 
 
+def _build_cp_quick_search_clause(search):
+    """Build OR LIKE clause for Container Plugin quick search. Returns (sql|None, params)."""
+    term = (search or '').strip()
+    if not term:
+        return None, []
+    like = f'%{term}%'
+    clause = (
+        '('
+        'CAST(cp.id AS CHAR) LIKE %s OR '
+        'CAST(cp.name AS CHAR) LIKE %s OR '
+        'CAST(IFNULL(cp.comments, "") AS CHAR) LIKE %s OR '
+        'CAST(IFNULL(cp.in_next_plugin, "") AS CHAR) LIKE %s OR '
+        'CAST(IFNULL(cp.out_next_plugin, "") AS CHAR) LIKE %s OR '
+        'CAST(IFNULL(cp.connectto_ipport, "") AS CHAR) LIKE %s'
+        ')'
+    )
+    return clause, [like, like, like, like, like, like]
+
+
 def _connect_profile_db(profile):
     return pymysql.connect(
         host=profile['host'],
@@ -563,7 +582,7 @@ def search_container_plugins():
     Body:
       - profileId (required)
       - page, page_size
-      - search (optional quick search on name/id/comments)
+      - search (optional quick search on id/name/comments/in_next/out_next/connectto_ipport)
       - filters: [{ field, operator, value }]
         field examples: cp.name, attr.field, attr.content
     """
@@ -593,18 +612,10 @@ def search_container_plugins():
     where_parts = []
     params = []
 
-    if search:
-        like = f'%{search}%'
-        where_parts.append(
-            '('
-            'CAST(cp.id AS CHAR) LIKE %s OR '
-            'CAST(cp.name AS CHAR) LIKE %s OR '
-            'CAST(IFNULL(cp.comments, "") AS CHAR) LIKE %s OR '
-            'CAST(IFNULL(cp.in_next_plugin, "") AS CHAR) LIKE %s OR '
-            'CAST(IFNULL(cp.out_next_plugin, "") AS CHAR) LIKE %s'
-            ')'
-        )
-        params.extend([like, like, like, like, like])
+    quick_clause, quick_params = _build_cp_quick_search_clause(search)
+    if quick_clause:
+        where_parts.append(quick_clause)
+        params.extend(quick_params)
 
     for f in filters:
         if not isinstance(f, dict):
