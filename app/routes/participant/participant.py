@@ -1031,25 +1031,29 @@ def get_duplicate_info():
             cursor.execute(f"SELECT * FROM container_plugin_attr WHERE container_plugin_id IN ({format_strings})", tuple(plugin_ids))
             plugin_attrs = cursor.fetchall()
             # 5. Fetch online configs for selected container_plugin_name, acq_participant_id, or iss_participant_id
+            # Use resolved participant['id'] — request may only send container_plugin_name.
+            resolved_participant_id = participant.get('id') if participant else participant_id
             online_configs = []
-            # By container_plugin_name
-            cursor.execute("SELECT * FROM online_config WHERE container_plugin_name = %s", (selected_container,))
-            online_configs.extend(cursor.fetchall())
-            # By acq_participant_id
-            cursor.execute("SELECT * FROM online_config WHERE acq_participant_id = %s", (participant_id,))
-            acq_configs = cursor.fetchall()
-            # By iss_participant_id
-            cursor.execute("SELECT * FROM online_config WHERE iss_participant_id = %s", (participant_id,))
-            iss_configs = cursor.fetchall()
-            # Merge all unique configs (by id if present, else by all fields)
             seen = set()
             def config_key(cfg):
                 return cfg.get('id') or tuple(sorted(cfg.items()))
-            for cfg in acq_configs + iss_configs:
+            # By container_plugin_name
+            cursor.execute("SELECT * FROM online_config WHERE container_plugin_name = %s", (selected_container,))
+            for cfg in cursor.fetchall():
                 k = config_key(cfg)
                 if k not in seen:
                     online_configs.append(cfg)
                     seen.add(k)
+            if resolved_participant_id not in (None, ''):
+                cursor.execute("SELECT * FROM online_config WHERE acq_participant_id = %s", (resolved_participant_id,))
+                acq_configs = cursor.fetchall()
+                cursor.execute("SELECT * FROM online_config WHERE iss_participant_id = %s", (resolved_participant_id,))
+                iss_configs = cursor.fetchall()
+                for cfg in acq_configs + iss_configs:
+                    k = config_key(cfg)
+                    if k not in seen:
+                        online_configs.append(cfg)
+                        seen.add(k)
         conn.close()
         return jsonify({
             'participant': participant,
@@ -1133,6 +1137,7 @@ def duplicate_participant():
                 cursor.execute("SELECT LAST_INSERT_ID() as new_id")
                 participant_id = cursor.fetchone()['new_id']
             # 2. Insert container_plugins (main + COM)
+            # Prefer _old_id from client so attrs can be remapped when new plugin IDs are auto-incremented.
             container_plugin_columns = [
                 'id', 'container_id', 'plugin_id', 'name', 'state_startup', 'port_listen',
                 'cnt_instances', 'in_next_plugin', 'out_next_plugin', 'connectto_ipport',
@@ -1141,6 +1146,7 @@ def duplicate_participant():
             ]
             old_to_new_cp_id = {}
             for cp in container_plugins:
+                source_cp_id = cp.get('_old_id', cp.get('id', None))
                 cp_insert = {k: v for k, v in cp.items() if k in container_plugin_columns}
                 cp_id = cp_insert.get('id', None)
                 if cp_id not in (None, ''):
@@ -1160,9 +1166,15 @@ def duplicate_participant():
                     new_cp_id = cursor.fetchone()['new_cp_id']
                 else:
                     new_cp_id = cp_id
-                old_to_new_cp_id[cp.get('id', None)] = new_cp_id
+                if source_cp_id not in (None, ''):
+                    old_to_new_cp_id[source_cp_id] = new_cp_id
+                    # Also key by string form — MySQL/JSON may return id as int or str
+                    old_to_new_cp_id[str(source_cp_id)] = new_cp_id
             conn.commit()
             # 3. Insert container_plugin_attrs
+            # Remap container_plugin_id via old→new map (keeps STAN/FINGERPRINT_DB_MODE/PARTICIPANT
+            # on the new main plugin id when IDs were left blank).
+            # For field=PARTICIPANT, content must be the newly inserted participant_id.
             container_plugin_attr_columns = [
                 'id', 'container_plugin_id', 'field', 'content'
             ]
@@ -1170,10 +1182,13 @@ def duplicate_participant():
                 attr_insert = attr.copy()
                 if 'id' in attr_insert:
                     del attr_insert['id']
-                # Update container_plugin_id reference if needed
                 old_cp_id = attr_insert.get('container_plugin_id', None)
                 if old_cp_id in old_to_new_cp_id:
                     attr_insert['container_plugin_id'] = old_to_new_cp_id[old_cp_id]
+                elif old_cp_id is not None and str(old_cp_id) in old_to_new_cp_id:
+                    attr_insert['container_plugin_id'] = old_to_new_cp_id[str(old_cp_id)]
+                if attr_insert.get('field') == 'PARTICIPANT':
+                    attr_insert['content'] = str(participant_id)
                 attr_insert = {k: v for k, v in attr_insert.items() if k in container_plugin_attr_columns}
                 attr_fields = list(attr_insert.keys())
                 attr_values = [attr_insert[f] for f in attr_fields]
